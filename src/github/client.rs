@@ -192,9 +192,7 @@ mod tests {
     async fn returns_rate_limited_on_401_with_rate_remaining_zero() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(
-                ResponseTemplate::new(401).append_header("x-ratelimit-remaining", "0"),
-            )
+            .respond_with(ResponseTemplate::new(401).append_header("x-ratelimit-remaining", "0"))
             .mount(&server)
             .await;
 
@@ -202,7 +200,9 @@ mod tests {
         let result = client.search_prs("author:user").await;
         assert!(matches!(
             result,
-            Err(AppError::RateLimited { retry_after_secs: 60 })
+            Err(AppError::RateLimited {
+                retry_after_secs: 60
+            })
         ));
     }
 
@@ -210,9 +210,7 @@ mod tests {
     async fn returns_rate_limited_with_retry_after_header() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(
-                ResponseTemplate::new(403).append_header("retry-after", "30"),
-            )
+            .respond_with(ResponseTemplate::new(403).append_header("retry-after", "30"))
             .mount(&server)
             .await;
 
@@ -220,7 +218,9 @@ mod tests {
         let result = client.search_prs("author:user").await;
         assert!(matches!(
             result,
-            Err(AppError::RateLimited { retry_after_secs: 30 })
+            Err(AppError::RateLimited {
+                retry_after_secs: 30
+            })
         ));
     }
 
@@ -244,8 +244,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"data": null})),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})),
             )
             .mount(&server)
             .await;

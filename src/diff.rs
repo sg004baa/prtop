@@ -38,8 +38,8 @@ pub fn diff_pr_sets(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use crate::types::{PrRole, PrState};
+    use chrono::Utc;
 
     fn make_pr(owner: &str, repo: &str, number: u64) -> (PrId, PullRequest) {
         let id = PrId {

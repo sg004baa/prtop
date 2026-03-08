@@ -11,7 +11,10 @@ fn deserialize_search_response() {
     let search = data.search;
     assert_eq!(search.issue_count, 2);
     assert!(!search.page_info.has_next_page);
-    assert_eq!(search.page_info.end_cursor, Some("Y3Vyc29yOjI=".to_string()));
+    assert_eq!(
+        search.page_info.end_cursor,
+        Some("Y3Vyc29yOjI=".to_string())
+    );
     assert_eq!(search.nodes.len(), 2);
 
     let first = &search.nodes[0];

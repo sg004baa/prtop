@@ -102,9 +102,9 @@ mod tests {
     fn invalid_returns_none() {
         assert_eq!(parse_color("notacolor"), None);
         assert_eq!(parse_color(""), None);
-        assert_eq!(parse_color("#12345"), None);   // too short
+        assert_eq!(parse_color("#12345"), None); // too short
         assert_eq!(parse_color("#1234567"), None); // too long
-        assert_eq!(parse_color("#gggggg"), None);  // invalid hex chars
+        assert_eq!(parse_color("#gggggg"), None); // invalid hex chars
         assert_eq!(parse_color("#"), None);
     }
 }

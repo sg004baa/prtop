@@ -1,8 +1,8 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, Paragraph};
-use ratatui::Frame;
 
 use crate::app::{App, LoadingState, Screen};
 use crate::types::{PrRole, PrState};
@@ -18,17 +18,21 @@ pub fn view(f: &mut Frame, app: &mut App) {
 /// Layout: [▸ ][role][  ][number][title][  ][repo]
 fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize) {
     let effective = (term_width as usize).saturating_sub(2); // 2 for "▸ " / "  "
-    let role: usize = 6;   // "AUTHOR", "REVIEW", "BOTH  "
+    let role: usize = 6; // "AUTHOR", "REVIEW", "BOTH  "
     let number: usize = 7; // "#12345 "
-    let seps: usize = 4;   // "  " after role + "  " after title
+    let seps: usize = 4; // "  " after role + "  " after title
     let fixed = role + seps + number;
     let remaining = effective.saturating_sub(fixed);
 
-    let max_repo = app.prs.keys()
+    let max_repo = app
+        .prs
+        .keys()
         .map(|id| id.owner.len() + 1 + id.repo.len())
         .max()
         .unwrap_or(15);
-    let max_title = app.prs.values()
+    let max_title = app
+        .prs
+        .values()
         .map(|pr| pr.title.chars().count())
         .max()
         .unwrap_or(20);
@@ -79,7 +83,11 @@ fn render_pr_list(f: &mut Frame, app: &mut App) {
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let last_poll = app
         .last_poll
-        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%H:%M:%S")
+                .to_string()
+        })
         .unwrap_or_else(|| "---".to_string());
 
     let error_indicator = if app.poll_error.is_some() { " [!]" } else { "" };
@@ -120,14 +128,13 @@ fn render_col_header(f: &mut Frame, app: &App, area: Rect, widths: (usize, usize
 fn render_list(f: &mut Frame, app: &mut App, area: Rect, widths: (usize, usize, usize, usize)) {
     match &app.loading {
         LoadingState::Initial | LoadingState::Loading => {
-            let loading = Paragraph::new("  Loading...")
-                .style(Style::default().fg(Color::Yellow));
+            let loading = Paragraph::new("  Loading...").style(Style::default().fg(Color::Yellow));
             f.render_widget(loading, area);
             return;
         }
         LoadingState::Error(msg) => {
-            let error = Paragraph::new(format!("  Error: {msg}"))
-                .style(Style::default().fg(Color::Red));
+            let error =
+                Paragraph::new(format!("  Error: {msg}")).style(Style::default().fg(Color::Red));
             f.render_widget(error, area);
             return;
         }
@@ -135,8 +142,8 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, widths: (usize, usize, 
     }
 
     if app.prs.is_empty() {
-        let empty = Paragraph::new("  No open PRs found")
-            .style(Style::default().fg(Color::DarkGray));
+        let empty =
+            Paragraph::new("  No open PRs found").style(Style::default().fg(Color::DarkGray));
         f.render_widget(empty, area);
         return;
     }
@@ -184,7 +191,11 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, widths: (usize, usize, 
                 ),
                 Span::raw("  "),
                 Span::styled(
-                    format!("{:<width$}", truncate(&repo_display, repo_w), width = repo_w),
+                    format!(
+                        "{:<width$}",
+                        truncate(&repo_display, repo_w),
+                        width = repo_w
+                    ),
                     Style::default().fg(app.colors.repo),
                 ),
             ]);
@@ -248,8 +259,7 @@ fn render_help(f: &mut Frame, _app: &mut App) {
         )),
     ];
 
-    let help = Paragraph::new(help_text)
-        .block(Block::default().title(" Help "));
+    let help = Paragraph::new(help_text).block(Block::default().title(" Help "));
     f.render_widget(help, f.area());
 }
 

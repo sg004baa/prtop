@@ -144,8 +144,7 @@ impl App {
                     if let Some((_, pr)) = self.prs.get_index(i) {
                         let url = pr.url.clone();
                         if open::that(&url).is_err() {
-                            self.status_message =
-                                Some(format!("Failed to open browser: {url}"));
+                            self.status_message = Some(format!("Failed to open browser: {url}"));
                             self.dirty = true;
                         }
                     }
@@ -202,11 +201,13 @@ impl App {
 
                     // Updated PR: notify when review_decision changed to ReviewRequired
                     for id in &diff.updated {
-                        let old_decision = self.prs.get(id).and_then(|p| p.review_decision.as_ref());
-                        let new_decision = payload.prs.get(id).and_then(|p| p.review_decision.as_ref());
+                        let old_decision =
+                            self.prs.get(id).and_then(|p| p.review_decision.as_ref());
+                        let new_decision =
+                            payload.prs.get(id).and_then(|p| p.review_decision.as_ref());
                         let became_review_required =
                             matches!(new_decision, Some(ReviewDecision::ReviewRequired))
-                            && !matches!(old_decision, Some(ReviewDecision::ReviewRequired));
+                                && !matches!(old_decision, Some(ReviewDecision::ReviewRequired));
                         if became_review_required {
                             if let Some(pr) = payload.prs.get(id) {
                                 self.pending_notifications.push(Notification {
@@ -359,7 +360,10 @@ mod tests {
         let mut app = App::new(ColorScheme::default());
         let id = make_id(1);
         let mut prs = IndexMap::new();
-        prs.insert(id.clone(), make_pr_custom(&id, PrRole::ReviewRequested, None, 0));
+        prs.insert(
+            id.clone(),
+            make_pr_custom(&id, PrRole::ReviewRequested, None, 0),
+        );
         app.update(Message::PollResult(payload_from(prs)));
         assert!(app.pending_notifications.is_empty());
     }
@@ -423,7 +427,12 @@ mod tests {
         let mut prs = IndexMap::new();
         prs.insert(
             id.clone(),
-            make_pr_custom(&id, PrRole::ReviewRequested, Some(ReviewDecision::Approved), 0),
+            make_pr_custom(
+                &id,
+                PrRole::ReviewRequested,
+                Some(ReviewDecision::Approved),
+                0,
+            ),
         );
         app.update(Message::PollResult(payload_from(prs)));
 

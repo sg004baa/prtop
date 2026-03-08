@@ -10,10 +10,12 @@ pub async fn event_loop(tx: mpsc::Sender<Message>, cancel: CancellationToken) {
             return;
         }
 
-        let event = tokio::task::spawn_blocking(|| event::poll(std::time::Duration::from_millis(100))
-            .ok()
-            .and_then(|ready| if ready { event::read().ok() } else { None }))
-            .await;
+        let event = tokio::task::spawn_blocking(|| {
+            event::poll(std::time::Duration::from_millis(100))
+                .ok()
+                .and_then(|ready| if ready { event::read().ok() } else { None })
+        })
+        .await;
 
         match event {
             Ok(Some(Event::Key(key))) => {

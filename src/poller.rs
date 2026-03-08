@@ -39,14 +39,8 @@ fn node_to_pr(node: PrNode, role: PrRole) -> PullRequest {
         author_login: node.author.map(|a| a.login).unwrap_or_default(),
         role,
         state: parse_state(&node.state),
-        created_at: node
-            .created_at
-            .parse::<DateTime<Utc>>()
-            .unwrap_or_default(),
-        updated_at: node
-            .updated_at
-            .parse::<DateTime<Utc>>()
-            .unwrap_or_default(),
+        created_at: node.created_at.parse::<DateTime<Utc>>().unwrap_or_default(),
+        updated_at: node.updated_at.parse::<DateTime<Utc>>().unwrap_or_default(),
         is_draft: node.is_draft,
         review_decision: ReviewDecision::from_str_opt(node.review_decision.as_deref()),
     }
@@ -288,9 +282,7 @@ mod tests {
     async fn polling_loop_stops_on_cancel() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(empty_graphql_response()),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_graphql_response()))
             .mount(&server)
             .await;
 
@@ -378,9 +370,7 @@ mod tests {
     async fn polling_loop_refresh_triggers_early_poll() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(empty_graphql_response()),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_graphql_response()))
             .mount(&server)
             .await;
 

@@ -2,7 +2,7 @@ use clap::Parser;
 use serde::Deserialize;
 use std::path::PathBuf;
 
-use crate::colors::{parse_color, ColorScheme};
+use crate::colors::{ColorScheme, parse_color};
 use crate::error::AppError;
 
 #[derive(Parser, Debug)]
@@ -100,14 +100,34 @@ impl Config {
         let fc = file.colors.unwrap_or_default();
         let d = ColorScheme::default();
         let color_scheme = ColorScheme {
-            app_title:    fc.app_title   .as_deref().and_then(parse_color).unwrap_or(d.app_title),
-            col_header:   fc.col_header  .as_deref().and_then(parse_color).unwrap_or(d.col_header),
-            role:         fc.role        .as_deref().and_then(parse_color).unwrap_or(d.role),
-            number:       fc.number      .as_deref().and_then(parse_color).unwrap_or(d.number),
-            repo:         fc.repo        .as_deref().and_then(parse_color).unwrap_or(d.repo),
-            new_pr:       fc.new_pr      .as_deref().and_then(parse_color).unwrap_or(d.new_pr),
-            draft:        fc.draft       .as_deref().and_then(parse_color).unwrap_or(d.draft),
-            footer_count: fc.footer_count.as_deref().and_then(parse_color).unwrap_or(d.footer_count),
+            app_title: fc
+                .app_title
+                .as_deref()
+                .and_then(parse_color)
+                .unwrap_or(d.app_title),
+            col_header: fc
+                .col_header
+                .as_deref()
+                .and_then(parse_color)
+                .unwrap_or(d.col_header),
+            role: fc.role.as_deref().and_then(parse_color).unwrap_or(d.role),
+            number: fc
+                .number
+                .as_deref()
+                .and_then(parse_color)
+                .unwrap_or(d.number),
+            repo: fc.repo.as_deref().and_then(parse_color).unwrap_or(d.repo),
+            new_pr: fc
+                .new_pr
+                .as_deref()
+                .and_then(parse_color)
+                .unwrap_or(d.new_pr),
+            draft: fc.draft.as_deref().and_then(parse_color).unwrap_or(d.draft),
+            footer_count: fc
+                .footer_count
+                .as_deref()
+                .and_then(parse_color)
+                .unwrap_or(d.footer_count),
         };
 
         Ok(Config {
