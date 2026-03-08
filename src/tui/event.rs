@@ -19,10 +19,10 @@ pub async fn event_loop(tx: mpsc::Sender<Message>, cancel: CancellationToken) {
 
         match event {
             Ok(Some(Event::Key(key))) => {
-                if let Some(msg) = key_to_message(key) {
-                    if tx.send(msg).await.is_err() {
-                        return;
-                    }
+                if let Some(msg) = key_to_message(key)
+                    && tx.send(msg).await.is_err()
+                {
+                    return;
                 }
             }
             Ok(_) => {}

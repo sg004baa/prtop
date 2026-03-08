@@ -140,13 +140,13 @@ impl App {
                 self.dirty = true;
             }
             Message::OpenSelected => {
-                if let Some(i) = self.list_state.selected() {
-                    if let Some((_, pr)) = self.prs.get_index(i) {
-                        let url = pr.url.clone();
-                        if open::that(&url).is_err() {
-                            self.status_message = Some(format!("Failed to open browser: {url}"));
-                            self.dirty = true;
-                        }
+                if let Some(i) = self.list_state.selected()
+                    && let Some((_, pr)) = self.prs.get_index(i)
+                {
+                    let url = pr.url.clone();
+                    if open::that(&url).is_err() {
+                        self.status_message = Some(format!("Failed to open browser: {url}"));
+                        self.dirty = true;
                     }
                 }
                 self.last_activity = Some(Instant::now());
@@ -177,25 +177,25 @@ impl App {
                 if already_loaded {
                     // PR closed/merged: only notify when we were the author
                     for id in &diff.removed {
-                        if let Some(pr) = self.prs.get(id) {
-                            if pr.role == PrRole::Author {
-                                self.pending_notifications.push(Notification {
-                                    title: "PR closed/merged".to_string(),
-                                    body: format!("{} ({})", pr.title, id),
-                                });
-                            }
+                        if let Some(pr) = self.prs.get(id)
+                            && pr.role == PrRole::Author
+                        {
+                            self.pending_notifications.push(Notification {
+                                title: "PR closed/merged".to_string(),
+                                body: format!("{} ({})", pr.title, id),
+                            });
                         }
                     }
 
                     // New PR added: only notify when we are NOT the author (review request)
                     for id in &diff.added {
-                        if let Some(pr) = payload.prs.get(id) {
-                            if pr.role != PrRole::Author {
-                                self.pending_notifications.push(Notification {
-                                    title: "Review requested".to_string(),
-                                    body: format!("{} ({})", pr.title, id),
-                                });
-                            }
+                        if let Some(pr) = payload.prs.get(id)
+                            && pr.role != PrRole::Author
+                        {
+                            self.pending_notifications.push(Notification {
+                                title: "Review requested".to_string(),
+                                body: format!("{} ({})", pr.title, id),
+                            });
                         }
                     }
 
@@ -208,13 +208,11 @@ impl App {
                         let became_review_required =
                             matches!(new_decision, Some(ReviewDecision::ReviewRequired))
                                 && !matches!(old_decision, Some(ReviewDecision::ReviewRequired));
-                        if became_review_required {
-                            if let Some(pr) = payload.prs.get(id) {
-                                self.pending_notifications.push(Notification {
-                                    title: "Re-review requested".to_string(),
-                                    body: format!("{} ({})", pr.title, id),
-                                });
-                            }
+                        if became_review_required && let Some(pr) = payload.prs.get(id) {
+                            self.pending_notifications.push(Notification {
+                                title: "Re-review requested".to_string(),
+                                body: format!("{} ({})", pr.title, id),
+                            });
                         }
                     }
                 }
