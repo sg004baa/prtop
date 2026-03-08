@@ -1,0 +1,25 @@
+# ~/.config/prtop/config.toml
+github_token = "ghp_xxx"
+username = "myuser"
+poll_interval_secs = 60
+
+# Notifications (via OSC 9 — requires terminal support, e.g. WezTerm)
+# Events notified:
+#   - PR closed/merged (author only)
+#   - Review requested (non-author only)
+#   - Re-review requested (review_decision changed to ReviewRequired)
+[notify]
+enabled = false
+
+# Colors
+# Accepts named colors (case-insensitive) or #rrggbb hex.
+# Named: `black`, `red`, `cyan`, `dark_gray`, etc.
+[colors]
+app_title    = "cyan"      # "GitHub PR Live" in header
+col_header   = "dark_gray" # ROLE / # / TITLE / REPO column headers
+role         = "cyan"      # AUTHOR / REVIEW / BOTH
+number       = "yellow"    # #1234
+repo         = "blue"      # org/repo
+new_pr       = "green"     # newly appeared PRs
+draft        = "dark_gray" # draft PRs
+footer_count = "green"     # "3 PRs" in footer

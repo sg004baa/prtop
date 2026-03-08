@@ -1,0 +1,37 @@
+[package]
+name = "prtop"
+version = "0.1.0"
+edition = "2024"
+authors = ["sg004baa"]
+description = "Terminal TUI for monitoring GitHub pull requests you're involved in as author or reviewer"
+license = "MIT"
+repository = "https://github.com/sg004baa/prtop"
+readme = "README.md"
+
+[[bin]]
+name = "prt"
+path = "src/main.rs"
+keywords = ["github", "pull-request", "tui", "terminal", "cli"]
+categories = ["command-line-utilities"]
+exclude = [".gitignore", "config.example.toml", ".github/"]
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+tokio = { version = "1.5", features = ["full"] }
+tokio-util = "0.7"
+reqwest = { version = "0.13", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+indexmap = "2"
+toml = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
+open = "5"
+dirs = "6"
+
+[dev-dependencies]
+wiremock = "0.6"
+pretty_assertions = "1"
+proptest = "1"

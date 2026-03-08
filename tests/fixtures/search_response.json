@@ -1,0 +1,51 @@
+{
+  "data": {
+    "search": {
+      "issueCount": 2,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOjI="
+      },
+      "nodes": [
+        {
+          "number": 1234,
+          "title": "Fix rendering bug",
+          "url": "https://github.com/ratatui/ratatui/pull/1234",
+          "state": "OPEN",
+          "isDraft": false,
+          "createdAt": "2024-01-15T10:30:00Z",
+          "updatedAt": "2024-01-16T14:20:00Z",
+          "reviewDecision": "APPROVED",
+          "author": {
+            "login": "testuser"
+          },
+          "repository": {
+            "name": "ratatui",
+            "owner": {
+              "login": "ratatui"
+            }
+          }
+        },
+        {
+          "number": 5678,
+          "title": "Add timeout feature for connections",
+          "url": "https://github.com/tokio-rs/tokio/pull/5678",
+          "state": "OPEN",
+          "isDraft": true,
+          "createdAt": "2024-01-10T08:00:00Z",
+          "updatedAt": "2024-01-14T16:45:00Z",
+          "reviewDecision": null,
+          "author": {
+            "login": "testuser"
+          },
+          "repository": {
+            "name": "tokio",
+            "owner": {
+              "login": "tokio-rs"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
