@@ -7,13 +7,13 @@ description = "Terminal TUI for monitoring GitHub pull requests you're involved 
 license = "MIT"
 repository = "https://github.com/sg004baa/prtop"
 readme = "README.md"
+keywords = ["github", "pull-request", "tui", "terminal", "cli"]
+categories = ["command-line-utilities"]
+exclude = [".gitignore", "config.example.toml", ".github/"]
 
 [[bin]]
 name = "prt"
 path = "src/main.rs"
-keywords = ["github", "pull-request", "tui", "terminal", "cli"]
-categories = ["command-line-utilities"]
-exclude = [".gitignore", "config.example.toml", ".github/"]
 
 [dependencies]
 ratatui = "0.30"
