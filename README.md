@@ -17,13 +17,7 @@ Tested on Linux(Ubuntu). macOS and Windows are untested.
 ## Installation
 
 ```bash
-cargo build --release
-cp target/release/prt ~/.local/bin/
-```
-
-Then run with:
-
-```bash
+cargo install prtop
 prt
 ```
 
