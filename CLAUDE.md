@@ -7,6 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cargo build                    # Dev build
 cargo build --release          # Release build
+cargo fmt                      # Format code
+cargo fmt --check              # Check formatting (CI uses this)
 cargo test                     # Run all tests
 cargo test diff::tests         # Run tests in a specific module
 cargo test --test diff_logic   # Run a specific integration test file
