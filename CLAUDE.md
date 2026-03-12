@@ -14,6 +14,7 @@ cargo test                     # Run all tests
 cargo test diff::tests         # Run tests in a specific module
 cargo test --test diff_logic   # Run a specific integration test file
 cargo test test_name           # Run a single test by name
+cargo license                  # List dependency licenses (requires: cargo install cargo-license)
 ```
 
 ## Architecture
