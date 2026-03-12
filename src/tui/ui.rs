@@ -14,14 +14,15 @@ pub fn view(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// Returns (role, number, repo, title) column widths based on actual PR data lengths.
-/// Layout: [▸ ][role][  ][number][title][  ][repo]
-fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize) {
+/// Returns (role, status, number, repo, title) column widths based on actual PR data lengths.
+/// Layout: [▸ ][role][  ][status][  ][number][title][  ][repo]
+fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize, usize) {
     let effective = (term_width as usize).saturating_sub(2); // 2 for "▸ " / "  "
     let role: usize = 6; // "AUTHOR", "REVIEW", "BOTH  "
+    let status: usize = 6; // "OPEN  ", "CLOSED", "MERGED"
     let number: usize = 7; // "#12345 "
-    let seps: usize = 4; // "  " after role + "  " after title
-    let fixed = role + seps + number;
+    let seps: usize = 6; // "  " after role, after status, after title
+    let fixed = role + status + seps + number;
     let remaining = effective.saturating_sub(fixed);
 
     let max_repo = app
@@ -44,7 +45,7 @@ fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize) {
         let title = remaining.saturating_sub(repo);
         (repo, title)
     };
-    (role, number, repo, title)
+    (role, status, number, repo, title)
 }
 
 fn pr_list_area(f: &Frame, app: &App) -> Rect {
@@ -108,14 +109,21 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(header), area);
 }
 
-fn render_col_header(f: &mut Frame, app: &App, area: Rect, widths: (usize, usize, usize, usize)) {
-    let (role_w, num_w, repo_w, title_w) = widths;
+fn render_col_header(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    widths: (usize, usize, usize, usize, usize),
+) {
+    let (role_w, status_w, num_w, repo_w, title_w) = widths;
     let style = Style::default()
         .fg(app.colors.col_header)
         .add_modifier(Modifier::BOLD);
     let header = Line::from(vec![
         Span::raw("  "), // indent to match list highlight symbol ("▸ " / "  ")
         Span::styled(format!("{:<width$}", "ROLE", width = role_w), style),
+        Span::raw("  "),
+        Span::styled(format!("{:<width$}", "STATUS", width = status_w), style),
         Span::raw("  "),
         Span::styled(format!("{:<width$}", "#", width = num_w), style),
         Span::styled(format!("{:<width$}", "TITLE", width = title_w), style),
@@ -125,7 +133,12 @@ fn render_col_header(f: &mut Frame, app: &App, area: Rect, widths: (usize, usize
     f.render_widget(Paragraph::new(header), area);
 }
 
-fn render_list(f: &mut Frame, app: &mut App, area: Rect, widths: (usize, usize, usize, usize)) {
+fn render_list(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    widths: (usize, usize, usize, usize, usize),
+) {
     match &app.loading {
         LoadingState::Initial | LoadingState::Loading => {
             let loading = Paragraph::new("  Loading...").style(Style::default().fg(Color::Yellow));
@@ -142,13 +155,12 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, widths: (usize, usize, 
     }
 
     if app.prs.is_empty() {
-        let empty =
-            Paragraph::new("  No open PRs found").style(Style::default().fg(Color::DarkGray));
+        let empty = Paragraph::new("  No PRs found").style(Style::default().fg(Color::DarkGray));
         f.render_widget(empty, area);
         return;
     }
 
-    let (role_w, num_w, repo_w, title_w) = widths;
+    let (role_w, status_w, num_w, repo_w, title_w) = widths;
 
     let items: Vec<ListItem> = app
         .prs
@@ -162,15 +174,19 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, widths: (usize, usize, 
                 PrRole::Both => "BOTH",
             };
 
+            let (status_tag, status_style) = match pr.state {
+                PrState::Open => ("OPEN", Style::default().fg(Color::Green)),
+                PrState::Closed => ("CLOSED", Style::default().fg(Color::Yellow)),
+                PrState::Merged => ("MERGED", Style::default().fg(Color::Magenta)),
+            };
+
             let repo_display = format!("{}/{}", id.owner, id.repo);
             let number_display = format!("#{}", id.number);
 
-            let pr_style = if is_new {
+            let title_style = if is_new {
                 Style::default().fg(app.colors.new_pr)
             } else if pr.is_draft {
                 Style::default().fg(app.colors.draft)
-            } else if matches!(pr.state, PrState::Merged) {
-                Style::default().fg(Color::Magenta)
             } else {
                 Style::default()
             };
@@ -182,12 +198,17 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect, widths: (usize, usize, 
                 ),
                 Span::raw("  "),
                 Span::styled(
+                    format!("{:<width$}", status_tag, width = status_w),
+                    status_style,
+                ),
+                Span::raw("  "),
+                Span::styled(
                     format!("{:<width$}", number_display, width = num_w),
                     Style::default().fg(app.colors.number),
                 ),
                 Span::styled(
                     format!("{:<width$}", truncate(&pr.title, title_w), width = title_w),
-                    pr_style,
+                    title_style,
                 ),
                 Span::raw("  "),
                 Span::styled(
