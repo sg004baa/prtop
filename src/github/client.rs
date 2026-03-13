@@ -7,7 +7,7 @@ use crate::github::types::{GraphQlResponse, PrNode};
 
 const GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const PAGE_SIZE: u64 = 50;
-const MAX_PAGES: u64 = 4;
+pub const MAX_PAGES: u64 = 4;
 
 pub struct GitHubClient {
     client: Client,
@@ -39,11 +39,15 @@ impl GitHubClient {
         }
     }
 
-    pub async fn search_prs(&self, search_query: &str) -> Result<Vec<PrNode>, AppError> {
+    pub async fn search_prs(
+        &self,
+        search_query: &str,
+        max_pages: u64,
+    ) -> Result<Vec<PrNode>, AppError> {
         let mut all_nodes = Vec::new();
         let mut cursor: Option<String> = None;
 
-        for _ in 0..MAX_PAGES {
+        for _ in 0..max_pages {
             let variables = json!({
                 "query": search_query,
                 "first": PAGE_SIZE,
@@ -158,7 +162,7 @@ mod tests {
             .await;
 
         let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.search_prs("author:user").await.unwrap();
+        let result = client.search_prs("author:user", MAX_PAGES).await.unwrap();
         assert!(result.is_empty());
     }
 
@@ -171,7 +175,7 @@ mod tests {
             .await;
 
         let client = GitHubClient::new_with_base_url("bad_token".to_string(), server.uri());
-        let result = client.search_prs("author:user").await;
+        let result = client.search_prs("author:user", MAX_PAGES).await;
         assert!(matches!(result, Err(AppError::Auth(_))));
     }
 
@@ -184,7 +188,7 @@ mod tests {
             .await;
 
         let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.search_prs("author:user").await;
+        let result = client.search_prs("author:user", MAX_PAGES).await;
         assert!(matches!(result, Err(AppError::Auth(_))));
     }
 
@@ -197,7 +201,7 @@ mod tests {
             .await;
 
         let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.search_prs("author:user").await;
+        let result = client.search_prs("author:user", MAX_PAGES).await;
         assert!(matches!(
             result,
             Err(AppError::RateLimited {
@@ -215,7 +219,7 @@ mod tests {
             .await;
 
         let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.search_prs("author:user").await;
+        let result = client.search_prs("author:user", MAX_PAGES).await;
         assert!(matches!(
             result,
             Err(AppError::RateLimited {
@@ -235,7 +239,7 @@ mod tests {
             .await;
 
         let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.search_prs("author:user").await;
+        let result = client.search_prs("author:user", MAX_PAGES).await;
         assert!(matches!(result, Err(AppError::GraphQl(_))));
     }
 
@@ -250,7 +254,7 @@ mod tests {
             .await;
 
         let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.search_prs("author:user").await;
+        let result = client.search_prs("author:user", MAX_PAGES).await;
         assert!(matches!(result, Err(AppError::GraphQl(_))));
     }
 
@@ -264,7 +268,7 @@ mod tests {
             .await;
 
         let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let _result = client.search_prs("author:user").await.unwrap();
+        let _result = client.search_prs("author:user", MAX_PAGES).await.unwrap();
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), MAX_PAGES as usize);
