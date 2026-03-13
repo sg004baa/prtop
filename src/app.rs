@@ -46,6 +46,7 @@ pub struct App {
     pub last_poll: Option<DateTime<Utc>>,
     pub poll_error: Option<String>,
     pub new_pr_ids: HashSet<PrId>,
+    pub dismissed_ids: HashSet<PrId>,
     pub should_quit: bool,
     pub status_message: Option<String>,
     pub dirty: bool,
@@ -64,6 +65,7 @@ impl App {
             last_poll: None,
             poll_error: None,
             new_pr_ids: HashSet::new(),
+            dismissed_ids: HashSet::new(),
             should_quit: false,
             status_message: None,
             dirty: true,
@@ -167,13 +169,19 @@ impl App {
                 }
             }
             Message::PollResult(payload) => {
-                let diff = diff_pr_sets(&self.prs, &payload.prs);
+                // Dismissed (closed/merged) PRs should not re-enter the list from the poller.
+                let mut incoming = payload.prs;
+                for id in &self.dismissed_ids {
+                    incoming.shift_remove(id);
+                }
+
+                let diff = diff_pr_sets(&self.prs, &incoming);
                 let already_loaded = matches!(self.loading, LoadingState::Loaded);
 
                 if already_loaded {
                     // New PR added: only notify when we are NOT the author (review request)
                     for id in &diff.added {
-                        if let Some(pr) = payload.prs.get(id)
+                        if let Some(pr) = incoming.get(id)
                             && pr.role != PrRole::Author
                         {
                             self.pending_notifications.push(Notification {
@@ -186,7 +194,7 @@ impl App {
                     // Updated PR: notify on close/merge (author only) or review_decision change
                     for id in &diff.updated {
                         let old_pr = self.prs.get(id);
-                        let new_pr = payload.prs.get(id);
+                        let new_pr = incoming.get(id);
                         if let (Some(old_pr), Some(new_pr)) = (old_pr, new_pr) {
                             if old_pr.state == PrState::Open
                                 && matches!(new_pr.state, PrState::Closed | PrState::Merged)
@@ -217,7 +225,7 @@ impl App {
                 }
 
                 self.new_pr_ids = diff.added.into_iter().collect();
-                self.prs = payload.prs;
+                self.prs = incoming;
                 self.last_poll = Some(payload.polled_at);
                 self.poll_error = None;
                 self.status_message = None;
@@ -248,6 +256,7 @@ impl App {
         if let Some((id, is_done)) = info {
             self.new_pr_ids.remove(&id);
             if is_done {
+                self.dismissed_ids.insert(id.clone());
                 self.prs.shift_remove(&id);
                 if self.prs.is_empty() {
                     self.list_state.select(None);
@@ -586,6 +595,69 @@ mod tests {
         app.update(Message::PollResult(payload_from(prs2)));
 
         assert!(app.pending_notifications.is_empty());
+    }
+
+    #[test]
+    fn dismissed_pr_does_not_reappear_after_next_poll() {
+        let mut app = App::new(ColorScheme::default());
+        let id_open = make_id(1);
+        let id_closed = make_id(2);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id_open.clone(),
+            make_pr_custom(&id_open, PrRole::Author, None, 0),
+        );
+        prs.insert(
+            id_closed.clone(),
+            make_closed_pr(&id_closed, PrRole::Author, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        // Focus the closed PR → gets dismissed
+        app.update(Message::MoveDown);
+        app.update(Message::MoveDown);
+        assert!(!app.prs.contains_key(&id_closed));
+        assert!(app.dismissed_ids.contains(&id_closed));
+
+        // Next poll still includes the closed PR in payload → should be filtered out
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id_open.clone(),
+            make_pr_custom(&id_open, PrRole::Author, None, 0),
+        );
+        prs2.insert(
+            id_closed.clone(),
+            make_closed_pr(&id_closed, PrRole::Author, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(
+            !app.prs.contains_key(&id_closed),
+            "dismissed PR must not reappear"
+        );
+        assert_eq!(app.prs.len(), 1);
+    }
+
+    #[test]
+    fn dismissed_pr_reappear_does_not_trigger_review_notification() {
+        let mut app = App::new(ColorScheme::default());
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(id.clone(), make_closed_pr(&id, PrRole::ReviewRequested, 0));
+        app.update(Message::PollResult(payload_from(prs.clone())));
+
+        // Focus the closed reviewer PR → dismissed
+        app.update(Message::MoveDown);
+        assert!(app.dismissed_ids.contains(&id));
+
+        // Transition to Loaded state so notifications would fire
+        // Next poll includes the same dismissed closed PR
+        app.update(Message::PollResult(payload_from(prs)));
+
+        assert!(
+            app.pending_notifications.is_empty(),
+            "dismissed PR re-entry must not produce notifications"
+        );
     }
 
     #[test]
