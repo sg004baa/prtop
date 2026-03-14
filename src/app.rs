@@ -213,8 +213,12 @@ impl App {
                                 && matches!(new_pr.state, PrState::Closed | PrState::Merged)
                                 && new_pr.role == PrRole::Author
                             {
+                                let title = match new_pr.state {
+                                    PrState::Merged => "PR merged",
+                                    _ => "PR closed",
+                                };
                                 self.pending_notifications.push(Notification {
-                                    title: "PR closed/merged".to_string(),
+                                    title: title.to_string(),
                                     body: format!("{} ({})", new_pr.title, id),
                                 });
                             }
@@ -436,7 +440,7 @@ mod tests {
         app.update(Message::PollResult(payload_from(prs2)));
 
         assert_eq!(app.pending_notifications.len(), 1);
-        assert_eq!(app.pending_notifications[0].title, "PR closed/merged");
+        assert_eq!(app.pending_notifications[0].title, "PR closed");
     }
 
     #[test]
@@ -452,7 +456,7 @@ mod tests {
         app.update(Message::PollResult(payload_from(prs2)));
 
         assert_eq!(app.pending_notifications.len(), 1);
-        assert_eq!(app.pending_notifications[0].title, "PR closed/merged");
+        assert_eq!(app.pending_notifications[0].title, "PR merged");
     }
 
     #[test]
