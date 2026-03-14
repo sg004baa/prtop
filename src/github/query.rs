@@ -32,9 +32,17 @@ query($query: String!, $first: Int!, $after: String) {
 "#;
 
 pub fn author_search_query(username: &str) -> String {
-    format!("is:open is:pr author:{username}")
+    format!("is:pr is:open author:{username}")
+}
+
+pub fn author_closed_search_query(username: &str) -> String {
+    format!("is:pr -is:open author:{username}")
 }
 
 pub fn review_requested_search_query(username: &str) -> String {
-    format!("is:open is:pr review-requested:{username}")
+    format!("is:pr is:open review-requested:{username}")
+}
+
+pub fn review_requested_closed_search_query(username: &str) -> String {
+    format!("is:pr -is:open review-requested:{username}")
 }

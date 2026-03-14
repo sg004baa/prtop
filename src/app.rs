@@ -9,7 +9,7 @@ use crate::colors::ColorScheme;
 use crate::diff::diff_pr_sets;
 use crate::notify::Notification;
 use crate::poller::PollPayload;
-use crate::types::{PrId, PrRole, PullRequest, ReviewDecision};
+use crate::types::{PrId, PrRole, PrState, PullRequest, ReviewDecision};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Screen {
@@ -46,6 +46,7 @@ pub struct App {
     pub last_poll: Option<DateTime<Utc>>,
     pub poll_error: Option<String>,
     pub new_pr_ids: HashSet<PrId>,
+    pub dismissed_ids: HashSet<PrId>,
     pub should_quit: bool,
     pub status_message: Option<String>,
     pub dirty: bool,
@@ -64,6 +65,7 @@ impl App {
             last_poll: None,
             poll_error: None,
             new_pr_ids: HashSet::new(),
+            dismissed_ids: HashSet::new(),
             should_quit: false,
             status_message: None,
             dirty: true,
@@ -112,9 +114,7 @@ impl App {
                     None => 0,
                 };
                 self.list_state.select(Some(i));
-                if let Some((id, _)) = self.prs.get_index(i) {
-                    self.new_pr_ids.remove(id);
-                }
+                self.dismiss_if_done(i);
                 self.last_activity = Some(Instant::now());
                 self.dirty = true;
             }
@@ -133,9 +133,7 @@ impl App {
                     None => 0,
                 };
                 self.list_state.select(Some(i));
-                if let Some((id, _)) = self.prs.get_index(i) {
-                    self.new_pr_ids.remove(id);
-                }
+                self.dismiss_if_done(i);
                 self.last_activity = Some(Instant::now());
                 self.dirty = true;
             }
@@ -171,25 +169,32 @@ impl App {
                 }
             }
             Message::PollResult(payload) => {
-                let diff = diff_pr_sets(&self.prs, &payload.prs);
+                // Dismissed (closed/merged) PRs should not re-enter the list from the poller.
+                let mut incoming = payload.prs;
+                for id in &self.dismissed_ids {
+                    incoming.shift_remove(id);
+                }
+
                 let already_loaded = matches!(self.loading, LoadingState::Loaded);
 
-                if already_loaded {
-                    // PR closed/merged: only notify when we were the author
-                    for id in &diff.removed {
-                        if let Some(pr) = self.prs.get(id)
-                            && pr.role == PrRole::Author
-                        {
-                            self.pending_notifications.push(Notification {
-                                title: "PR closed/merged".to_string(),
-                                body: format!("{} ({})", pr.title, id),
-                            });
-                        }
-                    }
+                if !already_loaded {
+                    // Initial load: show only open PRs.
+                    incoming.retain(|_, pr| pr.state == PrState::Open);
+                } else {
+                    // Subsequent polls: accept already-tracked PRs (they may have transitioned
+                    // from open to closed/merged) and new open PRs only.
+                    // This prevents closed/merged PRs that were never seen as open this session
+                    // from appearing in the list.
+                    incoming
+                        .retain(|id, pr| self.prs.contains_key(id) || pr.state == PrState::Open);
+                }
 
+                let diff = diff_pr_sets(&self.prs, &incoming);
+
+                if already_loaded {
                     // New PR added: only notify when we are NOT the author (review request)
                     for id in &diff.added {
-                        if let Some(pr) = payload.prs.get(id)
+                        if let Some(pr) = incoming.get(id)
                             && pr.role != PrRole::Author
                         {
                             self.pending_notifications.push(Notification {
@@ -199,26 +204,41 @@ impl App {
                         }
                     }
 
-                    // Updated PR: notify when review_decision changed to ReviewRequired
+                    // Updated PR: notify on close/merge (author only) or review_decision change
                     for id in &diff.updated {
-                        let old_decision =
-                            self.prs.get(id).and_then(|p| p.review_decision.as_ref());
-                        let new_decision =
-                            payload.prs.get(id).and_then(|p| p.review_decision.as_ref());
-                        let became_review_required =
-                            matches!(new_decision, Some(ReviewDecision::ReviewRequired))
-                                && !matches!(old_decision, Some(ReviewDecision::ReviewRequired));
-                        if became_review_required && let Some(pr) = payload.prs.get(id) {
-                            self.pending_notifications.push(Notification {
-                                title: "Re-review requested".to_string(),
-                                body: format!("{} ({})", pr.title, id),
-                            });
+                        let old_pr = self.prs.get(id);
+                        let new_pr = incoming.get(id);
+                        if let (Some(old_pr), Some(new_pr)) = (old_pr, new_pr) {
+                            if old_pr.state == PrState::Open
+                                && matches!(new_pr.state, PrState::Closed | PrState::Merged)
+                                && new_pr.role == PrRole::Author
+                            {
+                                self.pending_notifications.push(Notification {
+                                    title: "PR closed/merged".to_string(),
+                                    body: format!("{} ({})", new_pr.title, id),
+                                });
+                            }
+
+                            let old_decision = old_pr.review_decision.as_ref();
+                            let new_decision = new_pr.review_decision.as_ref();
+                            let became_review_required =
+                                matches!(new_decision, Some(ReviewDecision::ReviewRequired))
+                                    && !matches!(
+                                        old_decision,
+                                        Some(ReviewDecision::ReviewRequired)
+                                    );
+                            if became_review_required {
+                                self.pending_notifications.push(Notification {
+                                    title: "Re-review requested".to_string(),
+                                    body: format!("{} ({})", new_pr.title, id),
+                                });
+                            }
                         }
                     }
                 }
 
                 self.new_pr_ids = diff.added.into_iter().collect();
-                self.prs = payload.prs;
+                self.prs = incoming;
                 self.last_poll = Some(payload.polled_at);
                 self.poll_error = None;
                 self.status_message = None;
@@ -234,6 +254,28 @@ impl App {
                     self.loading = LoadingState::Error(msg);
                 }
                 self.dirty = true;
+            }
+        }
+    }
+
+    /// フォーカスされた PR が closed/merged なら即座にリストから削除する。
+    fn dismiss_if_done(&mut self, i: usize) {
+        let info = self.prs.get_index(i).map(|(id, pr)| {
+            (
+                id.clone(),
+                matches!(pr.state, PrState::Closed | PrState::Merged),
+            )
+        });
+        if let Some((id, is_done)) = info {
+            self.new_pr_ids.remove(&id);
+            if is_done {
+                self.dismissed_ids.insert(id.clone());
+                self.prs.shift_remove(&id);
+                if self.prs.is_empty() {
+                    self.list_state.select(None);
+                } else {
+                    self.list_state.select(Some(i.min(self.prs.len() - 1)));
+                }
             }
         }
     }
@@ -278,6 +320,20 @@ mod tests {
             updated_at: base + chrono::Duration::seconds(updated_secs),
             is_draft: false,
             review_decision,
+        }
+    }
+
+    fn make_closed_pr(id: &PrId, role: PrRole, updated_secs: i64) -> PullRequest {
+        PullRequest {
+            state: PrState::Closed,
+            ..make_pr_custom(id, role, None, updated_secs)
+        }
+    }
+
+    fn make_merged_pr(id: &PrId, role: PrRole, updated_secs: i64) -> PullRequest {
+        PullRequest {
+            state: PrState::Merged,
+            ..make_pr_custom(id, role, None, updated_secs)
         }
     }
 
@@ -367,19 +423,40 @@ mod tests {
     }
 
     #[test]
-    fn removed_author_pr_triggers_notification() {
+    fn closed_author_pr_triggers_notification() {
         let mut app = App::new(ColorScheme::default());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(id.clone(), make_pr_custom(&id, PrRole::Author, None, 0));
         app.update(Message::PollResult(payload_from(prs)));
-        app.update(Message::PollResult(payload_from(IndexMap::new())));
+
+        // Second poll: same PR now Closed (updated_at bumped)
+        let mut prs2 = IndexMap::new();
+        prs2.insert(id.clone(), make_closed_pr(&id, PrRole::Author, 100));
+        app.update(Message::PollResult(payload_from(prs2)));
+
         assert_eq!(app.pending_notifications.len(), 1);
         assert_eq!(app.pending_notifications[0].title, "PR closed/merged");
     }
 
     #[test]
-    fn removed_reviewer_pr_no_notification() {
+    fn merged_author_pr_triggers_notification() {
+        let mut app = App::new(ColorScheme::default());
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(id.clone(), make_pr_custom(&id, PrRole::Author, None, 0));
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(id.clone(), make_merged_pr(&id, PrRole::Author, 100));
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert_eq!(app.pending_notifications.len(), 1);
+        assert_eq!(app.pending_notifications[0].title, "PR closed/merged");
+    }
+
+    #[test]
+    fn closed_reviewer_pr_no_notification() {
         let mut app = App::new(ColorScheme::default());
         let id = make_id(1);
         let mut prs = IndexMap::new();
@@ -388,8 +465,72 @@ mod tests {
             make_pr_custom(&id, PrRole::ReviewRequested, None, 0),
         );
         app.update(Message::PollResult(payload_from(prs)));
-        app.update(Message::PollResult(payload_from(IndexMap::new())));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_closed_pr(&id, PrRole::ReviewRequested, 100),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
         assert!(app.pending_notifications.is_empty());
+    }
+
+    #[test]
+    fn focus_on_closed_pr_removes_it() {
+        let mut app = App::new(ColorScheme::default());
+        let id_open = make_id(1);
+        let id_closed = make_id(2);
+
+        // Initial poll: both open
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id_open.clone(),
+            make_pr_custom(&id_open, PrRole::Author, None, 0),
+        );
+        prs.insert(
+            id_closed.clone(),
+            make_pr_custom(&id_closed, PrRole::Author, None, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        // Second poll: id_closed transitions to Closed during session
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id_open.clone(),
+            make_pr_custom(&id_open, PrRole::Author, None, 0),
+        );
+        prs2.insert(
+            id_closed.clone(),
+            make_closed_pr(&id_closed, PrRole::Author, 100),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        // Focus index 0 (open) - stays
+        app.update(Message::MoveDown);
+        assert_eq!(app.prs.len(), 2);
+
+        // Focus index 1 (closed) - gets removed
+        app.update(Message::MoveDown);
+        assert_eq!(app.prs.len(), 1);
+        assert!(app.prs.contains_key(&id_open));
+        assert!(!app.prs.contains_key(&id_closed));
+    }
+
+    #[test]
+    fn focus_on_merged_pr_removes_it() {
+        let mut app = App::new(ColorScheme::default());
+        let id_merged = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id_merged.clone(),
+            make_merged_pr(&id_merged, PrRole::Author, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        app.update(Message::MoveDown);
+        assert!(app.prs.is_empty());
+        assert_eq!(app.list_state.selected(), None);
     }
 
     #[test]
@@ -481,6 +622,152 @@ mod tests {
         app.update(Message::PollResult(payload_from(prs2)));
 
         assert!(app.pending_notifications.is_empty());
+    }
+
+    #[test]
+    fn dismissed_pr_does_not_reappear_after_next_poll() {
+        let mut app = App::new(ColorScheme::default());
+        let id_open = make_id(1);
+        let id_closed = make_id(2);
+
+        // Initial poll: both open
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id_open.clone(),
+            make_pr_custom(&id_open, PrRole::Author, None, 0),
+        );
+        prs.insert(
+            id_closed.clone(),
+            make_pr_custom(&id_closed, PrRole::Author, None, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        // Second poll: id_closed transitions to Closed during session
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id_open.clone(),
+            make_pr_custom(&id_open, PrRole::Author, None, 0),
+        );
+        prs2.insert(
+            id_closed.clone(),
+            make_closed_pr(&id_closed, PrRole::Author, 100),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        // Focus the closed PR → gets dismissed
+        app.update(Message::MoveDown);
+        app.update(Message::MoveDown);
+        assert!(!app.prs.contains_key(&id_closed));
+        assert!(app.dismissed_ids.contains(&id_closed));
+
+        // Next poll still includes the closed PR in payload → should be filtered out
+        let mut prs3 = IndexMap::new();
+        prs3.insert(
+            id_open.clone(),
+            make_pr_custom(&id_open, PrRole::Author, None, 0),
+        );
+        prs3.insert(
+            id_closed.clone(),
+            make_closed_pr(&id_closed, PrRole::Author, 100),
+        );
+        app.update(Message::PollResult(payload_from(prs3)));
+
+        assert!(
+            !app.prs.contains_key(&id_closed),
+            "dismissed PR must not reappear"
+        );
+        assert_eq!(app.prs.len(), 1);
+    }
+
+    #[test]
+    fn dismissed_pr_reappear_does_not_trigger_review_notification() {
+        let mut app = App::new(ColorScheme::default());
+        let id = make_id(1);
+
+        // Initial poll: open reviewer PR
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_custom(&id, PrRole::ReviewRequested, None, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        // Second poll: PR transitions to Closed during session
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_closed_pr(&id, PrRole::ReviewRequested, 100),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        // Focus the closed reviewer PR → dismissed
+        app.update(Message::MoveDown);
+        assert!(app.dismissed_ids.contains(&id));
+
+        // Clear any notifications from the transition poll
+        app.pending_notifications.clear();
+
+        // Next poll still includes the dismissed closed PR → must not re-enter or notify
+        let mut prs3 = IndexMap::new();
+        prs3.insert(
+            id.clone(),
+            make_closed_pr(&id, PrRole::ReviewRequested, 100),
+        );
+        app.update(Message::PollResult(payload_from(prs3)));
+
+        assert!(
+            app.pending_notifications.is_empty(),
+            "dismissed PR re-entry must not produce notifications"
+        );
+    }
+
+    #[test]
+    fn closed_pr_not_tracked_in_session_does_not_appear_on_subsequent_poll() {
+        // Regression: closed/merged PRs that were already closed before the session started
+        // must not appear in the list, even when they arrive in a subsequent poll payload.
+        let mut app = App::new(ColorScheme::default());
+        let id_open = make_id(1);
+        let id_closing = make_id(2);
+        let id_already_closed = make_id(3);
+
+        // Initial poll: only open PRs
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id_open.clone(),
+            make_pr_custom(&id_open, PrRole::Author, None, 0),
+        );
+        prs.insert(
+            id_closing.clone(),
+            make_pr_custom(&id_closing, PrRole::Author, None, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+        assert_eq!(app.prs.len(), 2);
+
+        // Second poll: id_closing transitions + an already-closed PR arrives from API
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id_open.clone(),
+            make_pr_custom(&id_open, PrRole::Author, None, 0),
+        );
+        prs2.insert(
+            id_closing.clone(),
+            make_closed_pr(&id_closing, PrRole::Author, 100),
+        );
+        prs2.insert(
+            id_already_closed.clone(),
+            make_closed_pr(&id_already_closed, PrRole::Author, 50),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(
+            !app.prs.contains_key(&id_already_closed),
+            "PR closed before session must not appear"
+        );
+        assert!(
+            app.prs.contains_key(&id_closing),
+            "PR that transitioned during session must appear"
+        );
+        assert_eq!(app.prs.len(), 2); // id_open + id_closing
     }
 
     #[test]

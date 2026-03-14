@@ -17,6 +17,16 @@ cargo test test_name           # Run a single test by name
 cargo license                  # List dependency licenses (requires: cargo install cargo-license)
 ```
 
+## Pre-push Checklist
+
+Before pushing, always run:
+
+```bash
+cargo fmt --check
+cargo clippy -- -D warnings
+cargo test
+```
+
 ## Architecture
 
 Terminal-resident TUI app that monitors GitHub PRs you're involved in (as author or reviewer), using The Elm Architecture (TEA) pattern.

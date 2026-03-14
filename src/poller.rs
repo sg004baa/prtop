@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::AppError;
-use crate::github::client::GitHubClient;
+use crate::github::client::{GitHubClient, MAX_PAGES};
 use crate::github::query;
 use crate::github::types::PrNode;
 use crate::types::{PrId, PrRole, PrState, PullRequest, ReviewDecision};
@@ -131,16 +131,26 @@ pub async fn polling_loop(
 }
 
 async fn poll_once(client: &GitHubClient, username: &str) -> Result<PollPayload, AppError> {
-    let author_query = query::author_search_query(username);
-    let review_query = query::review_requested_search_query(username);
+    let author_open_query = query::author_search_query(username);
+    let author_closed_query = query::author_closed_search_query(username);
+    let review_open_query = query::review_requested_search_query(username);
+    let review_closed_query = query::review_requested_closed_search_query(username);
 
-    let (author_result, review_result) = tokio::join!(
-        client.search_prs(&author_query),
-        client.search_prs(&review_query),
+    // Run all four queries in parallel.
+    // Open queries are fully paginated to ensure no active PRs are missed.
+    // Closed/merged queries fetch only one page (the most recently updated ones).
+    let (author_open, author_closed, review_open, review_closed) = tokio::join!(
+        client.search_prs(&author_open_query, MAX_PAGES),
+        client.search_prs(&author_closed_query, 1),
+        client.search_prs(&review_open_query, MAX_PAGES),
+        client.search_prs(&review_closed_query, 1),
     );
 
-    let author_nodes = author_result?;
-    let review_nodes = review_result?;
+    let mut author_nodes = author_open?;
+    author_nodes.extend(author_closed?);
+
+    let mut review_nodes = review_open?;
+    review_nodes.extend(review_closed?);
 
     let prs = merge_and_convert(author_nodes, review_nodes);
 
