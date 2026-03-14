@@ -175,8 +175,21 @@ impl App {
                     incoming.shift_remove(id);
                 }
 
-                let diff = diff_pr_sets(&self.prs, &incoming);
                 let already_loaded = matches!(self.loading, LoadingState::Loaded);
+
+                if !already_loaded {
+                    // Initial load: show only open PRs.
+                    incoming.retain(|_, pr| pr.state == PrState::Open);
+                } else {
+                    // Subsequent polls: accept already-tracked PRs (they may have transitioned
+                    // from open to closed/merged) and new open PRs only.
+                    // This prevents closed/merged PRs that were never seen as open this session
+                    // from appearing in the list.
+                    incoming
+                        .retain(|id, pr| self.prs.contains_key(id) || pr.state == PrState::Open);
+                }
+
+                let diff = diff_pr_sets(&self.prs, &incoming);
 
                 if already_loaded {
                     // New PR added: only notify when we are NOT the author (review request)
@@ -468,6 +481,8 @@ mod tests {
         let mut app = App::new(ColorScheme::default());
         let id_open = make_id(1);
         let id_closed = make_id(2);
+
+        // Initial poll: both open
         let mut prs = IndexMap::new();
         prs.insert(
             id_open.clone(),
@@ -475,9 +490,21 @@ mod tests {
         );
         prs.insert(
             id_closed.clone(),
-            make_closed_pr(&id_closed, PrRole::Author, 0),
+            make_pr_custom(&id_closed, PrRole::Author, None, 0),
         );
         app.update(Message::PollResult(payload_from(prs)));
+
+        // Second poll: id_closed transitions to Closed during session
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id_open.clone(),
+            make_pr_custom(&id_open, PrRole::Author, None, 0),
+        );
+        prs2.insert(
+            id_closed.clone(),
+            make_closed_pr(&id_closed, PrRole::Author, 100),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
 
         // Focus index 0 (open) - stays
         app.update(Message::MoveDown);
@@ -602,6 +629,8 @@ mod tests {
         let mut app = App::new(ColorScheme::default());
         let id_open = make_id(1);
         let id_closed = make_id(2);
+
+        // Initial poll: both open
         let mut prs = IndexMap::new();
         prs.insert(
             id_open.clone(),
@@ -609,9 +638,21 @@ mod tests {
         );
         prs.insert(
             id_closed.clone(),
-            make_closed_pr(&id_closed, PrRole::Author, 0),
+            make_pr_custom(&id_closed, PrRole::Author, None, 0),
         );
         app.update(Message::PollResult(payload_from(prs)));
+
+        // Second poll: id_closed transitions to Closed during session
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id_open.clone(),
+            make_pr_custom(&id_open, PrRole::Author, None, 0),
+        );
+        prs2.insert(
+            id_closed.clone(),
+            make_closed_pr(&id_closed, PrRole::Author, 100),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
 
         // Focus the closed PR → gets dismissed
         app.update(Message::MoveDown);
@@ -620,16 +661,16 @@ mod tests {
         assert!(app.dismissed_ids.contains(&id_closed));
 
         // Next poll still includes the closed PR in payload → should be filtered out
-        let mut prs2 = IndexMap::new();
-        prs2.insert(
+        let mut prs3 = IndexMap::new();
+        prs3.insert(
             id_open.clone(),
             make_pr_custom(&id_open, PrRole::Author, None, 0),
         );
-        prs2.insert(
+        prs3.insert(
             id_closed.clone(),
-            make_closed_pr(&id_closed, PrRole::Author, 0),
+            make_closed_pr(&id_closed, PrRole::Author, 100),
         );
-        app.update(Message::PollResult(payload_from(prs2)));
+        app.update(Message::PollResult(payload_from(prs3)));
 
         assert!(
             !app.prs.contains_key(&id_closed),
@@ -642,22 +683,85 @@ mod tests {
     fn dismissed_pr_reappear_does_not_trigger_review_notification() {
         let mut app = App::new(ColorScheme::default());
         let id = make_id(1);
+
+        // Initial poll: open reviewer PR
         let mut prs = IndexMap::new();
-        prs.insert(id.clone(), make_closed_pr(&id, PrRole::ReviewRequested, 0));
-        app.update(Message::PollResult(payload_from(prs.clone())));
+        prs.insert(
+            id.clone(),
+            make_pr_custom(&id, PrRole::ReviewRequested, None, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        // Second poll: PR transitions to Closed during session
+        let mut prs2 = IndexMap::new();
+        prs2.insert(id.clone(), make_closed_pr(&id, PrRole::ReviewRequested, 100));
+        app.update(Message::PollResult(payload_from(prs2)));
 
         // Focus the closed reviewer PR → dismissed
         app.update(Message::MoveDown);
         assert!(app.dismissed_ids.contains(&id));
 
-        // Transition to Loaded state so notifications would fire
-        // Next poll includes the same dismissed closed PR
-        app.update(Message::PollResult(payload_from(prs)));
+        // Clear any notifications from the transition poll
+        app.pending_notifications.clear();
+
+        // Next poll still includes the dismissed closed PR → must not re-enter or notify
+        let mut prs3 = IndexMap::new();
+        prs3.insert(id.clone(), make_closed_pr(&id, PrRole::ReviewRequested, 100));
+        app.update(Message::PollResult(payload_from(prs3)));
 
         assert!(
             app.pending_notifications.is_empty(),
             "dismissed PR re-entry must not produce notifications"
         );
+    }
+
+    #[test]
+    fn closed_pr_not_tracked_in_session_does_not_appear_on_subsequent_poll() {
+        // Regression: closed/merged PRs that were already closed before the session started
+        // must not appear in the list, even when they arrive in a subsequent poll payload.
+        let mut app = App::new(ColorScheme::default());
+        let id_open = make_id(1);
+        let id_closing = make_id(2);
+        let id_already_closed = make_id(3);
+
+        // Initial poll: only open PRs
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id_open.clone(),
+            make_pr_custom(&id_open, PrRole::Author, None, 0),
+        );
+        prs.insert(
+            id_closing.clone(),
+            make_pr_custom(&id_closing, PrRole::Author, None, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+        assert_eq!(app.prs.len(), 2);
+
+        // Second poll: id_closing transitions + an already-closed PR arrives from API
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id_open.clone(),
+            make_pr_custom(&id_open, PrRole::Author, None, 0),
+        );
+        prs2.insert(
+            id_closing.clone(),
+            make_closed_pr(&id_closing, PrRole::Author, 100),
+        );
+        prs2.insert(
+            id_already_closed.clone(),
+            make_closed_pr(&id_already_closed, PrRole::Author, 50),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(
+            !app.prs.contains_key(&id_already_closed),
+            "PR closed before session must not appear"
+        );
+        assert!(
+            app.prs.contains_key(&id_closing),
+            "PR that transitioned during session must appear"
+        );
+        assert_eq!(app.prs.len(), 2); // id_open + id_closing
     }
 
     #[test]
