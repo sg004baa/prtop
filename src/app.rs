@@ -694,7 +694,10 @@ mod tests {
 
         // Second poll: PR transitions to Closed during session
         let mut prs2 = IndexMap::new();
-        prs2.insert(id.clone(), make_closed_pr(&id, PrRole::ReviewRequested, 100));
+        prs2.insert(
+            id.clone(),
+            make_closed_pr(&id, PrRole::ReviewRequested, 100),
+        );
         app.update(Message::PollResult(payload_from(prs2)));
 
         // Focus the closed reviewer PR → dismissed
@@ -706,7 +709,10 @@ mod tests {
 
         // Next poll still includes the dismissed closed PR → must not re-enter or notify
         let mut prs3 = IndexMap::new();
-        prs3.insert(id.clone(), make_closed_pr(&id, PrRole::ReviewRequested, 100));
+        prs3.insert(
+            id.clone(),
+            make_closed_pr(&id, PrRole::ReviewRequested, 100),
+        );
         app.update(Message::PollResult(payload_from(prs3)));
 
         assert!(
