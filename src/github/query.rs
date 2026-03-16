@@ -25,6 +25,12 @@ query($query: String!, $first: Int!, $after: String) {
             login
           }
         }
+        comments {
+          totalCount
+        }
+        reviewComments {
+          totalCount
+        }
       }
     }
   }

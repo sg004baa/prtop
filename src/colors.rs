@@ -8,6 +8,7 @@ pub struct ColorScheme {
     pub number: Color,
     pub repo: Color,
     pub new_pr: Color,
+    pub new_comment: Color,
     pub draft: Color,
     pub footer_count: Color,
 }
@@ -21,6 +22,7 @@ impl Default for ColorScheme {
             number: Color::Yellow,
             repo: Color::Blue,
             new_pr: Color::Green,
+            new_comment: Color::LightYellow,
             draft: Color::DarkGray,
             footer_count: Color::Green,
         }

@@ -46,6 +46,7 @@ pub struct App {
     pub last_poll: Option<DateTime<Utc>>,
     pub poll_error: Option<String>,
     pub new_pr_ids: HashSet<PrId>,
+    pub new_comment_pr_ids: HashSet<PrId>,
     pub dismissed_ids: HashSet<PrId>,
     pub should_quit: bool,
     pub status_message: Option<String>,
@@ -65,6 +66,7 @@ impl App {
             last_poll: None,
             poll_error: None,
             new_pr_ids: HashSet::new(),
+            new_comment_pr_ids: HashSet::new(),
             dismissed_ids: HashSet::new(),
             should_quit: false,
             status_message: None,
@@ -139,8 +141,9 @@ impl App {
             }
             Message::OpenSelected => {
                 if let Some(i) = self.list_state.selected()
-                    && let Some((_, pr)) = self.prs.get_index(i)
+                    && let Some((id, pr)) = self.prs.get_index(i)
                 {
+                    self.new_comment_pr_ids.remove(id);
                     let url = pr.url.clone();
                     if open::that(&url).is_err() {
                         self.status_message = Some(format!("Failed to open browser: {url}"));
@@ -239,9 +242,26 @@ impl App {
                             }
                         }
                     }
+
+                    // Comment count increase: compare all PRs directly, independent of updated_at
+                    for (id, new_pr) in &incoming {
+                        if let Some(old_pr) = self.prs.get(id)
+                            && new_pr.total_comments > old_pr.total_comments
+                            && matches!(new_pr.role, PrRole::Author | PrRole::Both)
+                        {
+                            self.pending_notifications.push(Notification {
+                                title: "New comment".to_string(),
+                                body: format!("{} ({})", new_pr.title, id),
+                            });
+                            self.new_comment_pr_ids.insert(id.clone());
+                        }
+                    }
                 }
 
                 self.new_pr_ids = diff.added.into_iter().collect();
+                // Prune new_comment_pr_ids for PRs no longer in the list
+                self.new_comment_pr_ids
+                    .retain(|id| incoming.contains_key(id));
                 self.prs = incoming;
                 self.last_poll = Some(payload.polled_at);
                 self.poll_error = None;
@@ -272,6 +292,7 @@ impl App {
         });
         if let Some((id, is_done)) = info {
             self.new_pr_ids.remove(&id);
+            self.new_comment_pr_ids.remove(&id);
             if is_done {
                 self.dismissed_ids.insert(id.clone());
                 self.prs.shift_remove(&id);
@@ -312,6 +333,16 @@ mod tests {
         review_decision: Option<ReviewDecision>,
         updated_secs: i64,
     ) -> PullRequest {
+        make_pr_with_comments(id, role, review_decision, updated_secs, 0)
+    }
+
+    fn make_pr_with_comments(
+        id: &PrId,
+        role: PrRole,
+        review_decision: Option<ReviewDecision>,
+        updated_secs: i64,
+        total_comments: u64,
+    ) -> PullRequest {
         let base: chrono::DateTime<Utc> = "2024-01-01T00:00:00Z".parse().unwrap();
         PullRequest {
             id: id.clone(),
@@ -324,20 +355,21 @@ mod tests {
             updated_at: base + chrono::Duration::seconds(updated_secs),
             is_draft: false,
             review_decision,
+            total_comments,
         }
     }
 
     fn make_closed_pr(id: &PrId, role: PrRole, updated_secs: i64) -> PullRequest {
         PullRequest {
             state: PrState::Closed,
-            ..make_pr_custom(id, role, None, updated_secs)
+            ..make_pr_with_comments(id, role, None, updated_secs, 0)
         }
     }
 
     fn make_merged_pr(id: &PrId, role: PrRole, updated_secs: i64) -> PullRequest {
         PullRequest {
             state: PrState::Merged,
-            ..make_pr_custom(id, role, None, updated_secs)
+            ..make_pr_with_comments(id, role, None, updated_secs, 0)
         }
     }
 
@@ -784,5 +816,214 @@ mod tests {
         // Second poll with same data: none new
         app.update(Message::PollResult(make_payload(2)));
         assert_eq!(app.new_pr_ids.len(), 0);
+    }
+
+    // --- Comment notification logic ---
+
+    #[test]
+    fn comment_increase_on_author_pr_triggers_notification() {
+        let mut app = App::new(ColorScheme::default());
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Author, None, 0, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        // Second poll: same PR, comment count increased, updated_at bumped
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Author, None, 100, 3),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert_eq!(app.pending_notifications.len(), 1);
+        assert_eq!(app.pending_notifications[0].title, "New comment");
+    }
+
+    #[test]
+    fn comment_increase_on_reviewer_pr_no_notification() {
+        let mut app = App::new(ColorScheme::default());
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::ReviewRequested, None, 0, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        // Second poll: comment count increased on a reviewer PR
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::ReviewRequested, None, 100, 3),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(app.pending_notifications.is_empty());
+    }
+
+    #[test]
+    fn comment_unchanged_no_notification() {
+        let mut app = App::new(ColorScheme::default());
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Author, None, 0, 5),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        // Second poll: updated_at bumped but comment count unchanged
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Author, None, 100, 5),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(app.pending_notifications.is_empty());
+    }
+
+    #[test]
+    fn comment_increase_sets_new_comment_pr_ids() {
+        let mut app = App::new(ColorScheme::default());
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Author, None, 0, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Author, None, 100, 2),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(app.new_comment_pr_ids.contains(&id));
+    }
+
+    #[test]
+    fn navigate_to_pr_clears_new_comment_pr_id() {
+        let mut app = App::new(ColorScheme::default());
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Author, None, 0, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Author, None, 100, 2),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+        assert!(app.new_comment_pr_ids.contains(&id));
+
+        // Navigate to the PR → should clear from new_comment_pr_ids
+        app.update(Message::MoveDown);
+        assert!(!app.new_comment_pr_ids.contains(&id));
+    }
+
+    #[test]
+    fn comment_increase_without_updated_at_triggers_notification() {
+        let mut app = App::new(ColorScheme::default());
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        // updated_at は固定 (0秒)、コメント数 0
+        prs.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Author, None, 0, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        // Second poll: updated_at 変化なし (same 0秒)、コメント数だけ増加
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Author, None, 0, 3),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert_eq!(app.pending_notifications.len(), 1);
+        assert_eq!(app.pending_notifications[0].title, "New comment");
+    }
+
+    #[test]
+    fn comment_increase_on_both_role_pr_triggers_notification() {
+        let mut app = App::new(ColorScheme::default());
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Both, None, 0, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Both, None, 100, 2),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert_eq!(app.pending_notifications.len(), 1);
+        assert_eq!(app.pending_notifications[0].title, "New comment");
+    }
+
+    #[test]
+    fn open_selected_clears_new_comment_pr_id() {
+        let mut app = App::new(ColorScheme::default());
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Author, None, 0, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Author, None, 100, 2),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+        app.update(Message::MoveDown); // select the PR
+        // re-add flag manually to simulate state
+        app.new_comment_pr_ids.insert(id.clone());
+
+        app.update(Message::OpenSelected);
+        assert!(!app.new_comment_pr_ids.contains(&id));
+    }
+
+    #[test]
+    fn new_comment_pr_ids_pruned_when_pr_removed_from_list() {
+        let mut app = App::new(ColorScheme::default());
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Author, None, 0, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Author, None, 100, 2),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+        assert!(app.new_comment_pr_ids.contains(&id));
+
+        // Third poll: PR is gone from the list
+        app.update(Message::PollResult(payload_from(IndexMap::new())));
+        assert!(!app.new_comment_pr_ids.contains(&id));
     }
 }

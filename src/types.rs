@@ -60,6 +60,7 @@ pub struct PullRequest {
     pub updated_at: DateTime<Utc>,
     pub is_draft: bool,
     pub review_decision: Option<ReviewDecision>,
+    pub total_comments: u64,
 }
 
 #[cfg(test)]

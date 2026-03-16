@@ -31,6 +31,7 @@ struct ColorsFileConfig {
     number: Option<String>,
     repo: Option<String>,
     new_pr: Option<String>,
+    new_comment: Option<String>,
     draft: Option<String>,
     footer_count: Option<String>,
 }
@@ -122,6 +123,11 @@ impl Config {
                 .as_deref()
                 .and_then(parse_color)
                 .unwrap_or(d.new_pr),
+            new_comment: fc
+                .new_comment
+                .as_deref()
+                .and_then(parse_color)
+                .unwrap_or(d.new_comment),
             draft: fc.draft.as_deref().and_then(parse_color).unwrap_or(d.draft),
             footer_count: fc
                 .footer_count
