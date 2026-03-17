@@ -43,7 +43,7 @@ fn node_to_pr(node: PrNode, role: PrRole) -> PullRequest {
         updated_at: node.updated_at.parse::<DateTime<Utc>>().unwrap_or_default(),
         is_draft: node.is_draft,
         review_decision: ReviewDecision::from_str_opt(node.review_decision.as_deref()),
-        total_comments: node.comments.total_count + node.review_comments.total_count,
+        total_comments: node.comments.total_count + node.review_threads.total_count,
     }
 }
 
@@ -189,7 +189,7 @@ mod tests {
                 },
             },
             comments: TotalCount { total_count: 0 },
-            review_comments: TotalCount { total_count: 0 },
+            review_threads: TotalCount { total_count: 0 },
         }
     }
 

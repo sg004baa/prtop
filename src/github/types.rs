@@ -52,7 +52,7 @@ pub struct PrNode {
     pub author: Option<ActorNode>,
     pub repository: RepoNode,
     pub comments: TotalCount,
-    pub review_comments: TotalCount,
+    pub review_threads: TotalCount,
 }
 
 #[derive(Debug, Deserialize)]

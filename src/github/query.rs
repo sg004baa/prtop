@@ -28,7 +28,7 @@ query($query: String!, $first: Int!, $after: String) {
         comments {
           totalCount
         }
-        reviewComments {
+        reviewThreads {
           totalCount
         }
       }
