@@ -143,6 +143,7 @@ impl App {
                 if let Some(i) = self.list_state.selected()
                     && let Some((id, pr)) = self.prs.get_index(i)
                 {
+                    self.new_pr_ids.remove(id);
                     self.new_comment_pr_ids.remove(id);
                     let url = pr.url.clone();
                     if open::that(&url).is_err() {
@@ -258,7 +259,10 @@ impl App {
                     }
                 }
 
-                self.new_pr_ids = diff.added.into_iter().collect();
+                if already_loaded {
+                    self.new_pr_ids.extend(diff.added.iter().cloned());
+                }
+                self.new_pr_ids.retain(|id| incoming.contains_key(id));
                 // Prune new_comment_pr_ids for PRs no longer in the list
                 self.new_comment_pr_ids
                     .retain(|id| incoming.contains_key(id));
@@ -810,11 +814,24 @@ mod tests {
     fn new_prs_detected() {
         let mut app = App::new(ColorScheme::default());
         app.update(Message::PollResult(make_payload(2)));
-        // First poll: all are "new"
-        assert_eq!(app.new_pr_ids.len(), 2);
+        // Initial load: no markers (all PRs are "known" from the start)
+        assert_eq!(app.new_pr_ids.len(), 0);
 
-        // Second poll with same data: none new
-        app.update(Message::PollResult(make_payload(2)));
+        // Second poll with a new PR added: only the new one gets a marker
+        app.update(Message::PollResult(make_payload(3)));
+        assert_eq!(app.new_pr_ids.len(), 1);
+
+        // Third poll with same data: marker persists
+        app.update(Message::PollResult(make_payload(3)));
+        assert_eq!(app.new_pr_ids.len(), 1);
+
+        // Navigating clears the focused PR's marker (index 0 = PR #0, not the new one)
+        app.update(Message::MoveDown);
+        assert_eq!(app.new_pr_ids.len(), 1);
+
+        // Navigate to the new PR (PR #2 at index 2)
+        app.update(Message::MoveDown);
+        app.update(Message::MoveDown);
         assert_eq!(app.new_pr_ids.len(), 0);
     }
 
