@@ -34,6 +34,12 @@ pub struct PageInfo {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TotalCount {
+    pub total_count: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PrNode {
     pub number: u64,
     pub title: String,
@@ -45,6 +51,8 @@ pub struct PrNode {
     pub review_decision: Option<String>,
     pub author: Option<ActorNode>,
     pub repository: RepoNode,
+    pub comments: TotalCount,
+    pub review_threads: TotalCount,
 }
 
 #[derive(Debug, Deserialize)]

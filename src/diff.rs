@@ -58,6 +58,7 @@ mod tests {
             updated_at: Utc::now(),
             is_draft: false,
             review_decision: None,
+            total_comments: 0,
         };
         (id, pr)
     }

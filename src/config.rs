@@ -14,7 +14,7 @@ struct Cli {
     #[arg(long, env = "PRTOP_GITHUB_USERNAME")]
     username: Option<String>,
 
-    #[arg(long, default_value = "60")]
+    #[arg(long)]
     poll_interval_secs: Option<u64>,
 }
 
@@ -31,6 +31,7 @@ struct ColorsFileConfig {
     number: Option<String>,
     repo: Option<String>,
     new_pr: Option<String>,
+    new_comment: Option<String>,
     draft: Option<String>,
     footer_count: Option<String>,
 }
@@ -53,8 +54,32 @@ pub struct Config {
     pub color_scheme: ColorScheme,
 }
 
+pub(crate) fn resolve_poll_interval(cli: Option<u64>, file: Option<u64>) -> u64 {
+    cli.or(file).unwrap_or(60)
+}
+
 fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("prtop").join("config.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_interval_file_wins_when_cli_not_specified() {
+        assert_eq!(resolve_poll_interval(None, Some(30)), 30);
+    }
+
+    #[test]
+    fn poll_interval_cli_wins_over_file() {
+        assert_eq!(resolve_poll_interval(Some(120), Some(30)), 120);
+    }
+
+    #[test]
+    fn poll_interval_defaults_to_60() {
+        assert_eq!(resolve_poll_interval(None, None), 60);
+    }
 }
 
 fn load_file_config() -> FileConfig {
@@ -90,10 +115,8 @@ impl Config {
                 )
             })?;
 
-        let poll_interval_secs = cli
-            .poll_interval_secs
-            .or(file.poll_interval_secs)
-            .unwrap_or(60);
+        let poll_interval_secs =
+            resolve_poll_interval(cli.poll_interval_secs, file.poll_interval_secs);
 
         let notify_enabled = file.notify.unwrap_or_default().enabled.unwrap_or(false);
 
@@ -122,6 +145,11 @@ impl Config {
                 .as_deref()
                 .and_then(parse_color)
                 .unwrap_or(d.new_pr),
+            new_comment: fc
+                .new_comment
+                .as_deref()
+                .and_then(parse_color)
+                .unwrap_or(d.new_comment),
             draft: fc.draft.as_deref().and_then(parse_color).unwrap_or(d.draft),
             footer_count: fc
                 .footer_count

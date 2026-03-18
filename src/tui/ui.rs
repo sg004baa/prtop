@@ -183,8 +183,11 @@ fn render_list(
             let repo_display = format!("{}/{}", id.owner, id.repo);
             let number_display = format!("#{}", id.number);
 
+            let has_new_comment = app.new_comment_pr_ids.contains(id);
             let title_style = if is_new {
                 Style::default().fg(app.colors.new_pr)
+            } else if has_new_comment {
+                Style::default().fg(app.colors.new_comment)
             } else if pr.is_draft {
                 Style::default().fg(app.colors.draft)
             } else {
