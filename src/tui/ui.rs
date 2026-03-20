@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, HighlightSpacing, List, ListItem, Paragraph};
 
 use crate::app::{App, LoadingState, Screen};
 use crate::types::{PrRole, PrState};
@@ -231,7 +231,8 @@ fn render_list(
     let list = List::new(items)
         .block(Block::default())
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
-        .highlight_symbol("▸ ");
+        .highlight_symbol("▸ ")
+        .highlight_spacing(HighlightSpacing::Always);
 
     f.render_stateful_widget(list, area, &mut app.list_state);
 }
