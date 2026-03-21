@@ -4,7 +4,7 @@ A terminal-resident TUI that monitors GitHub pull requests you're involved in as
 
 ## Features
 
-- Lists open PRs where you are the author or a requested reviewer
+- Lists PRs where you are the author or a requested reviewer, with status (Open/Closed/Merged)
 - Auto-refreshes on a configurable interval
 - Terminal notifications on key events (merged, review requested, re-review requested)
 - Keyboard navigation with browser open on Enter
@@ -29,9 +29,6 @@ Create `~/.config/prtop/config.toml`:
 github_token = "ghp_xxx"
 username = "github-username"
 poll_interval_secs = 60  # optional, default: 60
-
-[notify]
-enabled = false  # set to true to enable OSC 9 notifications
 ```
 
 See `config.example.toml` for a full example.
@@ -75,14 +72,16 @@ All UI colors can be customized in `config.toml`:
 
 ```toml
 [colors]
-app_title    = "cyan"      # "GitHub PR Live" in header
-col_header   = "dark_gray" # column header row
-role         = "cyan"      # AUTHOR / REVIEW / BOTH
-number       = "yellow"    # #1234
-repo         = "blue"      # org/repo
-new_pr       = "green"     # newly appeared PRs
-# draft      = "#888888"   # hex also accepted
-footer_count = "green"     # "3 PRs" in footer
+app_title    = "cyan"         # "GitHub PR Live" in header
+col_header   = "dark_gray"    # column header row
+role         = "cyan"         # AUTHOR / REVIEW / BOTH
+number       = "yellow"       # #1234
+repo         = "blue"         # org/repo
+new_pr       = "green"        # newly appeared PRs
+new_comment  = "light_yellow" # PRs with new comments
+draft        = "dark_gray"    # draft PRs
+footer_count = "green"        # "3 PRs" in footer
+# app_title  = "#00bfff"      # hex also accepted
 ```
 
 Accepted values: `#rrggbb` hex, or named colors (`black`, `red`, `cyan`, `dark_gray`, etc.). Unknown values fall back to the default.
