@@ -1,6 +1,6 @@
 [package]
 name = "prtop"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["sg004baa"]
 description = "Terminal TUI for monitoring GitHub pull requests you're involved in as author or reviewer"
