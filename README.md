@@ -2,6 +2,8 @@
 
 A terminal-resident TUI that monitors GitHub pull requests you're involved in as author or reviewer, updating in real time via periodic polling.
 
+![](<スクリーンショット 2026-03-21 144858.png>)
+
 ## Features
 
 - Lists PRs where you are the author or a requested reviewer, with status (Open/Closed/Merged)
@@ -35,11 +37,10 @@ See `config.example.toml` for a full example.
 
 Authentication can also be provided via CLI flags or environment variables
 
-| Setting | Flag | Env var |
-|---|---|---|
-| GitHub token | `--github-token` | `PRTOP_GITHUB_TOKEN` |
-| Username | `--username` | `PRTOP_GITHUB_USERNAME` |
-
+| Setting      | Flag             | Env var                 |
+| ------------ | ---------------- | ----------------------- |
+| GitHub token | `--github-token` | `PRTOP_GITHUB_TOKEN`    |
+| Username     | `--username`     | `PRTOP_GITHUB_USERNAME` |
 
 > [!CAUTION]
 > Grant **read-only** permissions only. prtop never writes to GitHub
@@ -59,12 +60,11 @@ enabled = true
 
 Events that trigger a notification:
 
-| Event | Condition |
-|---|---|
-| PR closed/merged | You are the **author** |
-| Review requested | You are **not** the author |
+| Event               | Condition                                     |
+| ------------------- | --------------------------------------------- |
+| PR closed/merged    | You are the **author**                        |
+| Review requested    | You are **not** the author                    |
 | Re-review requested | `review_decision` changed to `ReviewRequired` |
-
 
 ## Color Scheme
 
@@ -88,12 +88,11 @@ Accepted values: `#rrggbb` hex, or named colors (`black`, `red`, `cyan`, `dark_g
 
 ## Keybindings
 
-| Key | Action |
-|---|---|
-| `j` / `↓` | Move down |
-| `k` / `↑` | Move up |
-| `Enter` / `o` | Open PR in browser |
-| `r` | Force refresh |
-| `?` | Toggle help |
-| `q` / `Ctrl+C` | Quit |
-
+| Key            | Action             |
+| -------------- | ------------------ |
+| `j` / `↓`      | Move down          |
+| `k` / `↑`      | Move up            |
+| `Enter` / `o`  | Open PR in browser |
+| `r`            | Force refresh      |
+| `?`            | Toggle help        |
+| `q` / `Ctrl+C` | Quit               |
