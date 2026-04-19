@@ -39,6 +39,19 @@ pub struct TotalCount {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CommentNode {
+    pub author: Option<ActorNode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentsConnection {
+    pub total_count: u64,
+    #[serde(default)]
+    pub nodes: Vec<CommentNode>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrNode {
     pub number: u64,
@@ -51,7 +64,7 @@ pub struct PrNode {
     pub review_decision: Option<String>,
     pub author: Option<ActorNode>,
     pub repository: RepoNode,
-    pub comments: TotalCount,
+    pub comments: CommentsConnection,
     pub review_threads: TotalCount,
 }
 

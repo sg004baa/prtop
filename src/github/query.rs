@@ -25,8 +25,13 @@ query($query: String!, $first: Int!, $after: String) {
             login
           }
         }
-        comments {
+        comments(last: 1) {
           totalCount
+          nodes {
+            author {
+              login
+            }
+          }
         }
         reviewThreads {
           totalCount

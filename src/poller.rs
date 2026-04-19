@@ -44,6 +44,12 @@ fn node_to_pr(node: PrNode, role: PrRole) -> PullRequest {
         is_draft: node.is_draft,
         review_decision: ReviewDecision::from_str_opt(node.review_decision.as_deref()),
         total_comments: node.comments.total_count + node.review_threads.total_count,
+        last_commenter: node
+            .comments
+            .nodes
+            .first()
+            .and_then(|c| c.author.as_ref())
+            .map(|a| a.login.clone()),
     }
 }
 
@@ -165,7 +171,9 @@ async fn poll_once(client: &GitHubClient, username: &str) -> Result<PollPayload,
 mod tests {
     use super::*;
     use crate::github::client::GitHubClient;
-    use crate::github::types::{ActorNode, PrNode, RepoNode, RepoOwnerNode, TotalCount};
+    use crate::github::types::{
+        ActorNode, CommentsConnection, PrNode, RepoNode, RepoOwnerNode, TotalCount,
+    };
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -188,7 +196,10 @@ mod tests {
                     login: owner.to_string(),
                 },
             },
-            comments: TotalCount { total_count: 0 },
+            comments: CommentsConnection {
+                total_count: 0,
+                nodes: vec![],
+            },
             review_threads: TotalCount { total_count: 0 },
         }
     }
@@ -275,6 +286,44 @@ mod tests {
             pr.review_decision,
             Some(ReviewDecision::Unknown("FUTURE_DECISION".to_string()))
         );
+    }
+
+    // --- node_to_pr last_commenter extraction ---
+
+    #[test]
+    fn node_to_pr_extracts_last_commenter() {
+        use crate::github::types::CommentNode;
+        let mut node = make_node("org", "repo", 1);
+        node.comments = CommentsConnection {
+            total_count: 5,
+            nodes: vec![CommentNode {
+                author: Some(ActorNode {
+                    login: "reviewer1".to_string(),
+                }),
+            }],
+        };
+        let pr = node_to_pr(node, PrRole::Author);
+        assert_eq!(pr.last_commenter.as_deref(), Some("reviewer1"));
+        assert_eq!(pr.total_comments, 5); // review_threads(0) + comments(5)
+    }
+
+    #[test]
+    fn node_to_pr_empty_comments_gives_none() {
+        let node = make_node("org", "repo", 1);
+        let pr = node_to_pr(node, PrRole::Author);
+        assert_eq!(pr.last_commenter, None);
+    }
+
+    #[test]
+    fn node_to_pr_comment_author_none_gives_none() {
+        use crate::github::types::CommentNode;
+        let mut node = make_node("org", "repo", 1);
+        node.comments = CommentsConnection {
+            total_count: 2,
+            nodes: vec![CommentNode { author: None }],
+        };
+        let pr = node_to_pr(node, PrRole::Author);
+        assert_eq!(pr.last_commenter, None);
     }
 
     // --- polling_loop async control ---

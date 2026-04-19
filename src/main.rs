@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let notifier = build_notifier(config.notify_enabled);
 
     let mut terminal = tui::terminal::init()?;
-    let mut app = App::new(config.color_scheme.clone());
+    let mut app = App::new(config.username.clone(), config.color_scheme.clone());
 
     // Spawn event reader
     let event_cancel = cancel.clone();
