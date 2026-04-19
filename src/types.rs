@@ -61,6 +61,7 @@ pub struct PullRequest {
     pub is_draft: bool,
     pub review_decision: Option<ReviewDecision>,
     pub total_comments: u64,
+    pub last_commenter: Option<String>,
 }
 
 #[cfg(test)]

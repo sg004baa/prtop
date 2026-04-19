@@ -25,7 +25,12 @@
               "login": "ratatui"
             }
           },
-          "comments": { "totalCount": 3 },
+          "comments": {
+            "totalCount": 3,
+            "nodes": [
+              { "author": { "login": "reviewer1" } }
+            ]
+          },
           "reviewThreads": { "totalCount": 1 }
         },
         {

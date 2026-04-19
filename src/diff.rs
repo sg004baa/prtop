@@ -59,6 +59,7 @@ mod tests {
             is_draft: false,
             review_decision: None,
             total_comments: 0,
+            last_commenter: None,
         };
         (id, pr)
     }
