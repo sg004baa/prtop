@@ -19,6 +19,8 @@ pub enum NotifyEvent {
 }
 
 impl NotifyEvent {
+    /// All variants including opt-in ones. Used in tests only.
+    #[cfg(test)]
     pub fn all() -> HashSet<NotifyEvent> {
         HashSet::from([
             NotifyEvent::ReviewRequested,
@@ -27,6 +29,19 @@ impl NotifyEvent {
             NotifyEvent::ReReviewRequested,
             NotifyEvent::NewComment,
             NotifyEvent::CiFinished,
+        ])
+    }
+
+    /// Default events when `events` is not specified in config.
+    /// `CiFinished` is excluded because it requires additional PAT permissions
+    /// (Contents read) that may not be available.
+    pub fn defaults() -> HashSet<NotifyEvent> {
+        HashSet::from([
+            NotifyEvent::ReviewRequested,
+            NotifyEvent::PrClosed,
+            NotifyEvent::PrMerged,
+            NotifyEvent::ReReviewRequested,
+            NotifyEvent::NewComment,
         ])
     }
 }
@@ -89,7 +104,7 @@ pub(crate) fn resolve_poll_interval(cli: Option<u64>, file: Option<u64>) -> u64 
 pub(crate) fn resolve_notify_events(events: Option<Vec<NotifyEvent>>) -> HashSet<NotifyEvent> {
     match events {
         Some(v) => v.into_iter().collect(),
-        None => NotifyEvent::all(),
+        None => NotifyEvent::defaults(),
     }
 }
 
@@ -155,9 +170,31 @@ mod tests {
     // --- resolve_notify_events ---
 
     #[test]
-    fn resolve_events_none_returns_all() {
+    fn resolve_events_none_returns_defaults() {
         let events = resolve_notify_events(None);
-        assert_eq!(events, NotifyEvent::all());
+        assert_eq!(events, NotifyEvent::defaults());
+        assert!(!events.contains(&NotifyEvent::CiFinished));
+    }
+
+    #[test]
+    fn defaults_excludes_ci_finished() {
+        let defaults = NotifyEvent::defaults();
+        assert_eq!(defaults.len(), 5);
+        assert!(defaults.contains(&NotifyEvent::ReviewRequested));
+        assert!(defaults.contains(&NotifyEvent::PrClosed));
+        assert!(defaults.contains(&NotifyEvent::PrMerged));
+        assert!(defaults.contains(&NotifyEvent::ReReviewRequested));
+        assert!(defaults.contains(&NotifyEvent::NewComment));
+        assert!(!defaults.contains(&NotifyEvent::CiFinished));
+    }
+
+    #[test]
+    fn explicit_ci_finished_in_events_enables_it() {
+        let events = resolve_notify_events(Some(vec![
+            NotifyEvent::ReviewRequested,
+            NotifyEvent::CiFinished,
+        ]));
+        assert!(events.contains(&NotifyEvent::CiFinished));
     }
 
     #[test]

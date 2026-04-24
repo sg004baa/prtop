@@ -304,7 +304,11 @@ impl App {
                     .retain(|id| incoming.contains_key(id));
                 self.prs = incoming;
                 self.last_poll = Some(payload.polled_at);
-                self.poll_error = None;
+                self.poll_error = if payload.warnings.is_empty() {
+                    None
+                } else {
+                    Some(payload.warnings.join("; "))
+                };
                 self.status_message = None;
 
                 if matches!(self.loading, LoadingState::Initial | LoadingState::Loading) {
@@ -419,6 +423,7 @@ mod tests {
         PollPayload {
             prs,
             polled_at: Utc::now(),
+            warnings: Vec::new(),
         }
     }
 

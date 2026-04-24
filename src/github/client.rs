@@ -39,22 +39,27 @@ impl GitHubClient {
         }
     }
 
+    /// Returns (nodes, used_fallback).
+    /// `used_fallback` is true when the commits field was unavailable due to
+    /// insufficient permissions and we retried with a basic query.
     pub async fn search_prs(
         &self,
         search_query: &str,
         max_pages: u64,
-    ) -> Result<Vec<PrNode>, AppError> {
+    ) -> Result<(Vec<PrNode>, bool), AppError> {
         match self
             .search_prs_with_query(search_query, max_pages, SEARCH_PRS_QUERY)
             .await
         {
-            Ok(nodes) => Ok(nodes),
+            Ok(nodes) => Ok((nodes, false)),
             Err(AppError::GraphQl(msg)) if msg.contains("Resource not accessible") => {
                 // commits field requires Contents read permission which may not
                 // be available for repos where the user is only a reviewer.
                 // Fall back to the basic query without the commits field.
-                self.search_prs_with_query(search_query, max_pages, SEARCH_PRS_QUERY_BASIC)
-                    .await
+                let nodes = self
+                    .search_prs_with_query(search_query, max_pages, SEARCH_PRS_QUERY_BASIC)
+                    .await?;
+                Ok((nodes, true))
             }
             Err(e) => Err(e),
         }
@@ -184,8 +189,9 @@ mod tests {
             .await;
 
         let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.search_prs("author:user", MAX_PAGES).await.unwrap();
-        assert!(result.is_empty());
+        let (nodes, used_fallback) = client.search_prs("author:user", MAX_PAGES).await.unwrap();
+        assert!(nodes.is_empty());
+        assert!(!used_fallback);
     }
 
     #[tokio::test]
@@ -304,8 +310,9 @@ mod tests {
             .await;
 
         let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.search_prs("author:user", MAX_PAGES).await;
-        assert!(result.is_ok(), "expected fallback to succeed: {result:?}");
+        let (nodes, used_fallback) = client.search_prs("author:user", MAX_PAGES).await.unwrap();
+        assert!(nodes.is_empty());
+        assert!(used_fallback, "should indicate fallback was used");
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2, "expected 2 requests (full + fallback)");

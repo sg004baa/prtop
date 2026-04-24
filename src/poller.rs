@@ -15,6 +15,7 @@ use crate::types::{CiStatus, PrId, PrRole, PrState, PullRequest, ReviewDecision}
 pub struct PollPayload {
     pub prs: IndexMap<PrId, PullRequest>,
     pub polled_at: DateTime<Utc>,
+    pub warnings: Vec<String>,
 }
 
 fn parse_state(s: &str) -> PrState {
@@ -160,17 +161,29 @@ async fn poll_once(client: &GitHubClient, username: &str) -> Result<PollPayload,
         client.search_prs(&review_closed_query, 1),
     );
 
-    let mut author_nodes = author_open?;
-    author_nodes.extend(author_closed?);
+    let (mut author_nodes, fb1) = author_open?;
+    let (author_closed_nodes, fb2) = author_closed?;
+    author_nodes.extend(author_closed_nodes);
 
-    let mut review_nodes = review_open?;
-    review_nodes.extend(review_closed?);
+    let (mut review_nodes, fb3) = review_open?;
+    let (review_closed_nodes, fb4) = review_closed?;
+    review_nodes.extend(review_closed_nodes);
+
+    let used_fallback = fb1 || fb2 || fb3 || fb4;
+    let mut warnings = Vec::new();
+    if used_fallback {
+        warnings.push(
+            "CI status unavailable: token lacks Contents read permission for some repos"
+                .to_string(),
+        );
+    }
 
     let prs = merge_and_convert(author_nodes, review_nodes);
 
     Ok(PollPayload {
         prs,
         polled_at: Utc::now(),
+        warnings,
     })
 }
 
