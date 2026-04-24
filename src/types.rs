@@ -46,6 +46,39 @@ impl ReviewDecision {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CiStatus {
+    Pending,
+    Success,
+    Failure,
+    Error,
+    Expected,
+}
+
+impl CiStatus {
+    pub fn from_str_opt(s: Option<&str>) -> Option<Self> {
+        s.map(|s| match s {
+            "PENDING" => CiStatus::Pending,
+            "SUCCESS" => CiStatus::Success,
+            "FAILURE" => CiStatus::Failure,
+            "ERROR" => CiStatus::Error,
+            "EXPECTED" => CiStatus::Expected,
+            _ => CiStatus::Pending,
+        })
+    }
+
+    pub fn is_in_progress(&self) -> bool {
+        matches!(self, CiStatus::Pending | CiStatus::Expected)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        matches!(
+            self,
+            CiStatus::Success | CiStatus::Failure | CiStatus::Error
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PullRequest {
     pub id: PrId,
@@ -62,6 +95,7 @@ pub struct PullRequest {
     pub review_decision: Option<ReviewDecision>,
     pub total_comments: u64,
     pub last_commenter: Option<String>,
+    pub ci_status: Option<CiStatus>,
 }
 
 #[cfg(test)]
@@ -109,5 +143,59 @@ mod tests {
             number: 42,
         };
         assert_eq!(id.to_string(), "org/repo#42");
+    }
+
+    // --- CiStatus ---
+
+    #[test]
+    fn ci_status_none_input() {
+        assert_eq!(CiStatus::from_str_opt(None), None);
+    }
+
+    #[test]
+    fn ci_status_known_values() {
+        assert_eq!(
+            CiStatus::from_str_opt(Some("PENDING")),
+            Some(CiStatus::Pending)
+        );
+        assert_eq!(
+            CiStatus::from_str_opt(Some("SUCCESS")),
+            Some(CiStatus::Success)
+        );
+        assert_eq!(
+            CiStatus::from_str_opt(Some("FAILURE")),
+            Some(CiStatus::Failure)
+        );
+        assert_eq!(CiStatus::from_str_opt(Some("ERROR")), Some(CiStatus::Error));
+        assert_eq!(
+            CiStatus::from_str_opt(Some("EXPECTED")),
+            Some(CiStatus::Expected)
+        );
+    }
+
+    #[test]
+    fn ci_status_unknown_defaults_to_pending() {
+        assert_eq!(
+            CiStatus::from_str_opt(Some("WHATEVER")),
+            Some(CiStatus::Pending)
+        );
+    }
+
+    #[test]
+    fn ci_status_in_progress() {
+        assert!(CiStatus::Pending.is_in_progress());
+        assert!(CiStatus::Expected.is_in_progress());
+        assert!(!CiStatus::Success.is_in_progress());
+        assert!(!CiStatus::Failure.is_in_progress());
+        assert!(!CiStatus::Error.is_in_progress());
+    }
+
+    #[test]
+    fn ci_status_finished() {
+        assert!(CiStatus::Success.is_finished());
+        assert!(CiStatus::Failure.is_finished());
+        assert!(CiStatus::Error.is_finished());
+        assert!(!CiStatus::Pending.is_finished());
+        assert!(!CiStatus::Expected.is_finished());
     }
 }

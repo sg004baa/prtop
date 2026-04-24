@@ -10,7 +10,7 @@ use crate::error::AppError;
 use crate::github::client::{GitHubClient, MAX_PAGES};
 use crate::github::query;
 use crate::github::types::PrNode;
-use crate::types::{PrId, PrRole, PrState, PullRequest, ReviewDecision};
+use crate::types::{CiStatus, PrId, PrRole, PrState, PullRequest, ReviewDecision};
 
 pub struct PollPayload {
     pub prs: IndexMap<PrId, PullRequest>,
@@ -50,6 +50,12 @@ fn node_to_pr(node: PrNode, role: PrRole) -> PullRequest {
             .first()
             .and_then(|c| c.author.as_ref())
             .map(|a| a.login.clone()),
+        ci_status: node
+            .commits
+            .nodes
+            .first()
+            .and_then(|c| c.commit.status_check_rollup.as_ref())
+            .and_then(|r| CiStatus::from_str_opt(Some(&r.state))),
     }
 }
 
@@ -172,7 +178,8 @@ mod tests {
     use super::*;
     use crate::github::client::GitHubClient;
     use crate::github::types::{
-        ActorNode, CommentsConnection, PrNode, RepoNode, RepoOwnerNode, TotalCount,
+        ActorNode, CommentsConnection, CommitsConnection, PrNode, RepoNode, RepoOwnerNode,
+        TotalCount,
     };
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -201,6 +208,7 @@ mod tests {
                 nodes: vec![],
             },
             review_threads: TotalCount { total_count: 0 },
+            commits: CommitsConnection { nodes: vec![] },
         }
     }
 

@@ -15,6 +15,7 @@ pub enum NotifyEvent {
     PrMerged,
     ReReviewRequested,
     NewComment,
+    CiFinished,
 }
 
 impl NotifyEvent {
@@ -25,6 +26,7 @@ impl NotifyEvent {
             NotifyEvent::PrMerged,
             NotifyEvent::ReReviewRequested,
             NotifyEvent::NewComment,
+            NotifyEvent::CiFinished,
         ])
     }
 }
@@ -119,12 +121,13 @@ mod tests {
     #[test]
     fn notify_event_all_contains_every_variant() {
         let all = NotifyEvent::all();
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 6);
         assert!(all.contains(&NotifyEvent::ReviewRequested));
         assert!(all.contains(&NotifyEvent::PrClosed));
         assert!(all.contains(&NotifyEvent::PrMerged));
         assert!(all.contains(&NotifyEvent::ReReviewRequested));
         assert!(all.contains(&NotifyEvent::NewComment));
+        assert!(all.contains(&NotifyEvent::CiFinished));
     }
 
     #[test]
@@ -135,6 +138,7 @@ mod tests {
             ("\"pr_merged\"", NotifyEvent::PrMerged),
             ("\"re_review_requested\"", NotifyEvent::ReReviewRequested),
             ("\"new_comment\"", NotifyEvent::NewComment),
+            ("\"ci_finished\"", NotifyEvent::CiFinished),
         ];
         for (json, expected) in cases {
             let parsed: NotifyEvent = serde_json::from_str(json).unwrap();

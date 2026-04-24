@@ -36,6 +36,15 @@ query($query: String!, $first: Int!, $after: String) {
         reviewThreads {
           totalCount
         }
+        commits(last: 1) {
+          nodes {
+            commit {
+              statusCheckRollup {
+                state
+              }
+            }
+          }
+        }
       }
     }
   }

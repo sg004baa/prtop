@@ -53,6 +53,29 @@ pub struct CommentsConnection {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct StatusCheckRollup {
+    pub state: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitData {
+    pub status_check_rollup: Option<StatusCheckRollup>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommitNode {
+    pub commit: CommitData,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommitsConnection {
+    #[serde(default)]
+    pub nodes: Vec<CommitNode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PrNode {
     pub number: u64,
     pub title: String,
@@ -66,6 +89,7 @@ pub struct PrNode {
     pub repository: RepoNode,
     pub comments: CommentsConnection,
     pub review_threads: TotalCount,
+    pub commits: CommitsConnection,
 }
 
 #[derive(Debug, Deserialize)]
