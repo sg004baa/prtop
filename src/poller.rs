@@ -54,6 +54,7 @@ fn node_to_pr(node: PrNode, role: PrRole) -> PullRequest {
             .commits
             .nodes
             .first()
+            .and_then(|c| c.as_ref())
             .and_then(|c| c.commit.status_check_rollup.as_ref())
             .and_then(|r| CiStatus::from_str_opt(Some(&r.state))),
     }

@@ -71,7 +71,7 @@ pub struct CommitNode {
 #[derive(Debug, Deserialize)]
 pub struct CommitsConnection {
     #[serde(default)]
-    pub nodes: Vec<CommitNode>,
+    pub nodes: Vec<Option<CommitNode>>,
 }
 
 #[derive(Debug, Deserialize)]
