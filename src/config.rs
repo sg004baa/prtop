@@ -1,9 +1,33 @@
+use std::collections::HashSet;
+use std::path::PathBuf;
+
 use clap::Parser;
 use serde::Deserialize;
-use std::path::PathBuf;
 
 use crate::colors::{ColorScheme, parse_color};
 use crate::error::AppError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyEvent {
+    ReviewRequested,
+    PrClosed,
+    PrMerged,
+    ReReviewRequested,
+    NewComment,
+}
+
+impl NotifyEvent {
+    pub fn all() -> HashSet<NotifyEvent> {
+        HashSet::from([
+            NotifyEvent::ReviewRequested,
+            NotifyEvent::PrClosed,
+            NotifyEvent::PrMerged,
+            NotifyEvent::ReReviewRequested,
+            NotifyEvent::NewComment,
+        ])
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "prtop", about = "GitHub PR Live Viewer")]
@@ -21,6 +45,7 @@ struct Cli {
 #[derive(Debug, Deserialize, Default)]
 struct NotifyFileConfig {
     enabled: Option<bool>,
+    events: Option<Vec<NotifyEvent>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -51,11 +76,19 @@ pub struct Config {
     pub username: String,
     pub poll_interval_secs: u64,
     pub notify_enabled: bool,
+    pub notify_events: HashSet<NotifyEvent>,
     pub color_scheme: ColorScheme,
 }
 
 pub(crate) fn resolve_poll_interval(cli: Option<u64>, file: Option<u64>) -> u64 {
     cli.or(file).unwrap_or(60)
+}
+
+pub(crate) fn resolve_notify_events(events: Option<Vec<NotifyEvent>>) -> HashSet<NotifyEvent> {
+    match events {
+        Some(v) => v.into_iter().collect(),
+        None => NotifyEvent::all(),
+    }
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -79,6 +112,91 @@ mod tests {
     #[test]
     fn poll_interval_defaults_to_60() {
         assert_eq!(resolve_poll_interval(None, None), 60);
+    }
+
+    // --- NotifyEvent ---
+
+    #[test]
+    fn notify_event_all_contains_every_variant() {
+        let all = NotifyEvent::all();
+        assert_eq!(all.len(), 5);
+        assert!(all.contains(&NotifyEvent::ReviewRequested));
+        assert!(all.contains(&NotifyEvent::PrClosed));
+        assert!(all.contains(&NotifyEvent::PrMerged));
+        assert!(all.contains(&NotifyEvent::ReReviewRequested));
+        assert!(all.contains(&NotifyEvent::NewComment));
+    }
+
+    #[test]
+    fn notify_event_deserialize_snake_case() {
+        let cases = [
+            ("\"review_requested\"", NotifyEvent::ReviewRequested),
+            ("\"pr_closed\"", NotifyEvent::PrClosed),
+            ("\"pr_merged\"", NotifyEvent::PrMerged),
+            ("\"re_review_requested\"", NotifyEvent::ReReviewRequested),
+            ("\"new_comment\"", NotifyEvent::NewComment),
+        ];
+        for (json, expected) in cases {
+            let parsed: NotifyEvent = serde_json::from_str(json).unwrap();
+            assert_eq!(parsed, expected);
+        }
+    }
+
+    #[test]
+    fn notify_event_deserialize_unknown_fails() {
+        let result: Result<NotifyEvent, _> = serde_json::from_str("\"unknown_event\"");
+        assert!(result.is_err());
+    }
+
+    // --- resolve_notify_events ---
+
+    #[test]
+    fn resolve_events_none_returns_all() {
+        let events = resolve_notify_events(None);
+        assert_eq!(events, NotifyEvent::all());
+    }
+
+    #[test]
+    fn resolve_events_some_returns_specified() {
+        let events = resolve_notify_events(Some(vec![
+            NotifyEvent::ReviewRequested,
+            NotifyEvent::PrClosed,
+        ]));
+        assert_eq!(events.len(), 2);
+        assert!(events.contains(&NotifyEvent::ReviewRequested));
+        assert!(events.contains(&NotifyEvent::PrClosed));
+    }
+
+    #[test]
+    fn resolve_events_empty_returns_empty() {
+        let events = resolve_notify_events(Some(vec![]));
+        assert!(events.is_empty());
+    }
+
+    // --- TOML deserialization ---
+
+    #[test]
+    fn toml_notify_with_events() {
+        let toml_str = r#"
+            enabled = true
+            events = ["review_requested", "pr_merged"]
+        "#;
+        let parsed: NotifyFileConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.enabled, Some(true));
+        let events = parsed.events.unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events.contains(&NotifyEvent::ReviewRequested));
+        assert!(events.contains(&NotifyEvent::PrMerged));
+    }
+
+    #[test]
+    fn toml_notify_without_events() {
+        let toml_str = r#"
+            enabled = true
+        "#;
+        let parsed: NotifyFileConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.enabled, Some(true));
+        assert!(parsed.events.is_none());
     }
 }
 
@@ -118,7 +236,9 @@ impl Config {
         let poll_interval_secs =
             resolve_poll_interval(cli.poll_interval_secs, file.poll_interval_secs);
 
-        let notify_enabled = file.notify.unwrap_or_default().enabled.unwrap_or(false);
+        let notify_file = file.notify.unwrap_or_default();
+        let notify_enabled = notify_file.enabled.unwrap_or(false);
+        let notify_events = resolve_notify_events(notify_file.events);
 
         let fc = file.colors.unwrap_or_default();
         let d = ColorScheme::default();
@@ -163,6 +283,7 @@ impl Config {
             username,
             poll_interval_secs,
             notify_enabled,
+            notify_events,
             color_scheme,
         })
     }

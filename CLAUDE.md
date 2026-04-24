@@ -72,4 +72,6 @@ Notification triggers (only after initial load, checked in `Message::PollResult`
 
 CLI args > env vars (`GITHUB_TOKEN`, `GITHUB_USERNAME`) > `~/.config/prtop/config.toml`
 
-Config keys: `github_token`, `username`, `poll_interval_secs`, `[notify].backend`, `[notify].exec_command`
+Config keys: `github_token`, `username`, `poll_interval_secs`, `[notify].enabled`, `[notify].events`
+
+`[notify].events` accepts a list of event names: `review_requested`, `pr_closed`, `pr_merged`, `re_review_requested`, `new_comment`. Omitting `events` enables all. `enabled = false` is a global kill switch.
