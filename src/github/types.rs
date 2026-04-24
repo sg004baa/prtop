@@ -89,7 +89,8 @@ pub struct PrNode {
     pub repository: RepoNode,
     pub comments: CommentsConnection,
     pub review_threads: TotalCount,
-    pub commits: CommitsConnection,
+    #[serde(default)]
+    pub commits: Option<CommitsConnection>,
 }
 
 #[derive(Debug, Deserialize)]

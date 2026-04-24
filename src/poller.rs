@@ -52,8 +52,8 @@ fn node_to_pr(node: PrNode, role: PrRole) -> PullRequest {
             .map(|a| a.login.clone()),
         ci_status: node
             .commits
-            .nodes
-            .first()
+            .as_ref()
+            .and_then(|commits| commits.nodes.first())
             .and_then(|c| c.as_ref())
             .and_then(|c| c.commit.status_check_rollup.as_ref())
             .and_then(|r| CiStatus::from_str_opt(Some(&r.state))),
@@ -209,7 +209,7 @@ mod tests {
                 nodes: vec![],
             },
             review_threads: TotalCount { total_count: 0 },
-            commits: CommitsConnection { nodes: vec![] },
+            commits: Some(CommitsConnection { nodes: vec![] }),
         }
     }
 

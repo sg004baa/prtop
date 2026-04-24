@@ -2,7 +2,7 @@ use reqwest::Client;
 use serde_json::json;
 
 use crate::error::AppError;
-use crate::github::query::SEARCH_PRS_QUERY;
+use crate::github::query::{SEARCH_PRS_QUERY, SEARCH_PRS_QUERY_BASIC};
 use crate::github::types::{GraphQlResponse, PrNode};
 
 const GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
@@ -44,6 +44,28 @@ impl GitHubClient {
         search_query: &str,
         max_pages: u64,
     ) -> Result<Vec<PrNode>, AppError> {
+        match self
+            .search_prs_with_query(search_query, max_pages, SEARCH_PRS_QUERY)
+            .await
+        {
+            Ok(nodes) => Ok(nodes),
+            Err(AppError::GraphQl(msg)) if msg.contains("Resource not accessible") => {
+                // commits field requires Contents read permission which may not
+                // be available for repos where the user is only a reviewer.
+                // Fall back to the basic query without the commits field.
+                self.search_prs_with_query(search_query, max_pages, SEARCH_PRS_QUERY_BASIC)
+                    .await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn search_prs_with_query(
+        &self,
+        search_query: &str,
+        max_pages: u64,
+        graphql_query: &str,
+    ) -> Result<Vec<PrNode>, AppError> {
         let mut all_nodes = Vec::new();
         let mut cursor: Option<String> = None;
 
@@ -55,7 +77,7 @@ impl GitHubClient {
             });
 
             let body = json!({
-                "query": SEARCH_PRS_QUERY,
+                "query": graphql_query,
                 "variables": variables,
             });
 
@@ -256,6 +278,57 @@ mod tests {
         let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
         let result = client.search_prs("author:user", MAX_PAGES).await;
         assert!(matches!(result, Err(AppError::GraphQl(_))));
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_basic_query_on_resource_not_accessible() {
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+
+        // First call (full query with commits) returns "Resource not accessible" error
+        Mock::given(method("POST"))
+            .and(body_string_contains("statusCheckRollup"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": null,
+                "errors": [{"message": "Resource not accessible by personal access token"}]
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Second call (basic query without commits) returns success
+        Mock::given(method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(empty_response()))
+            .mount(&server)
+            .await;
+
+        let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
+        let result = client.search_prs("author:user", MAX_PAGES).await;
+        assert!(result.is_ok(), "expected fallback to succeed: {result:?}");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "expected 2 requests (full + fallback)");
+    }
+
+    #[tokio::test]
+    async fn non_resource_graphql_error_does_not_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errors": [{"message": "Some other error"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
+        let result = client.search_prs("author:user", MAX_PAGES).await;
+        assert!(
+            matches!(result, Err(AppError::GraphQl(ref msg)) if msg.contains("Some other error"))
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "should not retry on non-resource error");
     }
 
     #[tokio::test]
