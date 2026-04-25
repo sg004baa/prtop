@@ -56,15 +56,31 @@ To enable, add to `config.toml`:
 ```toml
 [notify]
 enabled = true
+# Per-event toggles (omit any line to use its default)
+# review_requested    = true
+# pr_closed           = true
+# pr_merged           = true
+# re_review_requested = true
+# new_comment         = true
+# ci_finished         = false
 ```
 
-Events that trigger a notification:
+`enabled` is a global kill switch — defaults to `false`, so notifications stay off until you opt in. Each event has its own toggle; omit a line to fall back to the default below.
 
-| Event               | Condition                                     |
-| ------------------- | --------------------------------------------- |
-| PR closed/merged    | You are the **author**                        |
-| Review requested    | You are **not** the author                    |
-| Re-review requested | `review_decision` changed to `ReviewRequired` |
+| Event                 | Default | Condition                                                       |
+| --------------------- | :-----: | --------------------------------------------------------------- |
+| `review_requested`    |    ✅    | A new PR appears where you are **not** the author               |
+| `pr_closed`           |    ✅    | Your authored PR transitions to closed                          |
+| `pr_merged`           |    ✅    | Your authored PR is merged                                      |
+| `re_review_requested` |    ✅    | `review_decision` changes to `ReviewRequired`                   |
+| `new_comment`         |    ✅    | Comment count increases on your authored PR (self-comment skip) |
+| `ci_finished`         |    ❌    | CI transitions from in-progress to success/failure (author/both) |
+
+`ci_finished` is opt-in because each poll issues per-PR REST calls to
+`/repos/{owner}/{repo}/commits/{sha}/status` and `/check-runs`. The token
+needs **Commit statuses: Read-only** and/or **Checks: Read-only** in addition
+to the base scopes. Without those scopes the per-PR calls 403/404 and CI
+notifications silently never fire.
 
 ## Color Scheme
 

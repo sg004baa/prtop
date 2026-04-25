@@ -32,9 +32,10 @@ impl NotifyEvent {
         ])
     }
 
-    /// Default events when `events` is not specified in config.
+    /// Default events when individual toggles are not specified in config.
     /// `CiFinished` is excluded because it requires additional PAT permissions
-    /// (Contents read) that may not be available.
+    /// (Commit statuses / Checks read) that may not be available.
+    #[cfg(test)]
     pub fn defaults() -> HashSet<NotifyEvent> {
         HashSet::from([
             NotifyEvent::ReviewRequested,
@@ -62,7 +63,12 @@ struct Cli {
 #[derive(Debug, Deserialize, Default)]
 struct NotifyFileConfig {
     enabled: Option<bool>,
-    events: Option<Vec<NotifyEvent>>,
+    review_requested: Option<bool>,
+    pr_closed: Option<bool>,
+    pr_merged: Option<bool>,
+    re_review_requested: Option<bool>,
+    new_comment: Option<bool>,
+    ci_finished: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -101,11 +107,27 @@ pub(crate) fn resolve_poll_interval(cli: Option<u64>, file: Option<u64>) -> u64 
     cli.or(file).unwrap_or(60)
 }
 
-pub(crate) fn resolve_notify_events(events: Option<Vec<NotifyEvent>>) -> HashSet<NotifyEvent> {
-    match events {
-        Some(v) => v.into_iter().collect(),
-        None => NotifyEvent::defaults(),
+fn resolve_notify_events(notify: &NotifyFileConfig) -> HashSet<NotifyEvent> {
+    let mut events = HashSet::new();
+    if notify.review_requested.unwrap_or(true) {
+        events.insert(NotifyEvent::ReviewRequested);
     }
+    if notify.pr_closed.unwrap_or(true) {
+        events.insert(NotifyEvent::PrClosed);
+    }
+    if notify.pr_merged.unwrap_or(true) {
+        events.insert(NotifyEvent::PrMerged);
+    }
+    if notify.re_review_requested.unwrap_or(true) {
+        events.insert(NotifyEvent::ReReviewRequested);
+    }
+    if notify.new_comment.unwrap_or(true) {
+        events.insert(NotifyEvent::NewComment);
+    }
+    if notify.ci_finished.unwrap_or(false) {
+        events.insert(NotifyEvent::CiFinished);
+    }
+    events
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -170,8 +192,8 @@ mod tests {
     // --- resolve_notify_events ---
 
     #[test]
-    fn resolve_events_none_returns_defaults() {
-        let events = resolve_notify_events(None);
+    fn resolve_all_none_returns_defaults() {
+        let events = resolve_notify_events(&NotifyFileConfig::default());
         assert_eq!(events, NotifyEvent::defaults());
         assert!(!events.contains(&NotifyEvent::CiFinished));
     }
@@ -189,55 +211,75 @@ mod tests {
     }
 
     #[test]
-    fn explicit_ci_finished_in_events_enables_it() {
-        let events = resolve_notify_events(Some(vec![
-            NotifyEvent::ReviewRequested,
-            NotifyEvent::CiFinished,
-        ]));
+    fn ci_finished_true_enables_it() {
+        let cfg = NotifyFileConfig {
+            ci_finished: Some(true),
+            ..Default::default()
+        };
+        let events = resolve_notify_events(&cfg);
         assert!(events.contains(&NotifyEvent::CiFinished));
+        // Other defaults still on.
+        assert!(events.contains(&NotifyEvent::ReviewRequested));
     }
 
     #[test]
-    fn resolve_events_some_returns_specified() {
-        let events = resolve_notify_events(Some(vec![
-            NotifyEvent::ReviewRequested,
-            NotifyEvent::PrClosed,
-        ]));
-        assert_eq!(events.len(), 2);
+    fn individual_false_disables_specific_event() {
+        let cfg = NotifyFileConfig {
+            new_comment: Some(false),
+            pr_merged: Some(false),
+            ..Default::default()
+        };
+        let events = resolve_notify_events(&cfg);
+        assert!(!events.contains(&NotifyEvent::NewComment));
+        assert!(!events.contains(&NotifyEvent::PrMerged));
         assert!(events.contains(&NotifyEvent::ReviewRequested));
         assert!(events.contains(&NotifyEvent::PrClosed));
+        assert!(events.contains(&NotifyEvent::ReReviewRequested));
     }
 
     #[test]
-    fn resolve_events_empty_returns_empty() {
-        let events = resolve_notify_events(Some(vec![]));
-        assert!(events.is_empty());
+    fn all_false_returns_empty() {
+        let cfg = NotifyFileConfig {
+            review_requested: Some(false),
+            pr_closed: Some(false),
+            pr_merged: Some(false),
+            re_review_requested: Some(false),
+            new_comment: Some(false),
+            ci_finished: Some(false),
+            ..Default::default()
+        };
+        assert!(resolve_notify_events(&cfg).is_empty());
     }
 
     // --- TOML deserialization ---
 
     #[test]
-    fn toml_notify_with_events() {
+    fn toml_notify_with_individual_toggles() {
         let toml_str = r#"
             enabled = true
-            events = ["review_requested", "pr_merged"]
+            new_comment = false
+            ci_finished = true
         "#;
         let parsed: NotifyFileConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(parsed.enabled, Some(true));
-        let events = parsed.events.unwrap();
-        assert_eq!(events.len(), 2);
+        assert_eq!(parsed.new_comment, Some(false));
+        assert_eq!(parsed.ci_finished, Some(true));
+        assert!(parsed.review_requested.is_none());
+
+        let events = resolve_notify_events(&parsed);
+        assert!(events.contains(&NotifyEvent::CiFinished));
+        assert!(!events.contains(&NotifyEvent::NewComment));
         assert!(events.contains(&NotifyEvent::ReviewRequested));
-        assert!(events.contains(&NotifyEvent::PrMerged));
     }
 
     #[test]
-    fn toml_notify_without_events() {
+    fn toml_notify_enabled_only_matches_defaults() {
         let toml_str = r#"
             enabled = true
         "#;
         let parsed: NotifyFileConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(parsed.enabled, Some(true));
-        assert!(parsed.events.is_none());
+        assert_eq!(resolve_notify_events(&parsed), NotifyEvent::defaults());
     }
 }
 
@@ -279,7 +321,7 @@ impl Config {
 
         let notify_file = file.notify.unwrap_or_default();
         let notify_enabled = notify_file.enabled.unwrap_or(false);
-        let notify_events = resolve_notify_events(notify_file.events);
+        let notify_events = resolve_notify_events(&notify_file);
 
         let fc = file.colors.unwrap_or_default();
         let d = ColorScheme::default();
