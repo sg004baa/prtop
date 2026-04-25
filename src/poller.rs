@@ -173,8 +173,7 @@ async fn poll_once(client: &GitHubClient, username: &str) -> Result<PollPayload,
     let mut warnings = Vec::new();
     if used_fallback {
         warnings.push(
-            "CI status unavailable: token lacks Contents read permission for some repos"
-                .to_string(),
+            "CI status unavailable for some repos (commits field not accessible)".to_string(),
         );
     }
 

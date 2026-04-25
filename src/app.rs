@@ -57,6 +57,7 @@ pub struct App {
     pub notify_events: HashSet<NotifyEvent>,
     pub colors: ColorScheme,
     pub username: String,
+    ci_fallback_warned: bool,
 }
 
 impl App {
@@ -79,6 +80,7 @@ impl App {
             notify_events,
             colors,
             username,
+            ci_fallback_warned: false,
         }
     }
 
@@ -304,11 +306,12 @@ impl App {
                     .retain(|id| incoming.contains_key(id));
                 self.prs = incoming;
                 self.last_poll = Some(payload.polled_at);
-                self.poll_error = if payload.warnings.is_empty() {
-                    None
-                } else {
-                    Some(payload.warnings.join("; "))
-                };
+                if !payload.warnings.is_empty() && !self.ci_fallback_warned {
+                    self.ci_fallback_warned = true;
+                    self.poll_error = Some(payload.warnings.join("; "));
+                } else if payload.warnings.is_empty() {
+                    self.poll_error = None;
+                }
                 self.status_message = None;
 
                 if matches!(self.loading, LoadingState::Initial | LoadingState::Loading) {
