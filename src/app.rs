@@ -57,7 +57,6 @@ pub struct App {
     pub notify_events: HashSet<NotifyEvent>,
     pub colors: ColorScheme,
     pub username: String,
-    ci_fallback_warned: bool,
 }
 
 impl App {
@@ -80,7 +79,6 @@ impl App {
             notify_events,
             colors,
             username,
-            ci_fallback_warned: false,
         }
     }
 
@@ -306,12 +304,7 @@ impl App {
                     .retain(|id| incoming.contains_key(id));
                 self.prs = incoming;
                 self.last_poll = Some(payload.polled_at);
-                if !payload.warnings.is_empty() && !self.ci_fallback_warned {
-                    self.ci_fallback_warned = true;
-                    self.poll_error = Some(payload.warnings.join("; "));
-                } else if payload.warnings.is_empty() {
-                    self.poll_error = None;
-                }
+                self.poll_error = None;
                 self.status_message = None;
 
                 if matches!(self.loading, LoadingState::Initial | LoadingState::Loading) {
@@ -426,7 +419,6 @@ mod tests {
         PollPayload {
             prs,
             polled_at: Utc::now(),
-            warnings: Vec::new(),
         }
     }
 
@@ -1524,32 +1516,6 @@ mod tests {
         prs2.insert(
             id.clone(),
             make_pr_with_ci(&id, PrRole::Author, 100, Some(CiStatus::Failure)),
-        );
-        app.update(Message::PollResult(payload_from(prs2)));
-
-        assert_eq!(app.pending_notifications.len(), 1);
-        assert_eq!(app.pending_notifications[0].title, "CI failed");
-    }
-
-    #[test]
-    fn ci_pending_to_error_triggers_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
-        let id = make_id(1);
-        let mut prs = IndexMap::new();
-        prs.insert(
-            id.clone(),
-            make_pr_with_ci(&id, PrRole::Author, 0, Some(CiStatus::Pending)),
-        );
-        app.update(Message::PollResult(payload_from(prs)));
-
-        let mut prs2 = IndexMap::new();
-        prs2.insert(
-            id.clone(),
-            make_pr_with_ci(&id, PrRole::Author, 100, Some(CiStatus::Error)),
         );
         app.update(Message::PollResult(payload_from(prs2)));
 

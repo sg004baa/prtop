@@ -53,29 +53,6 @@ pub struct CommentsConnection {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StatusCheckRollup {
-    pub state: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CommitData {
-    pub status_check_rollup: Option<StatusCheckRollup>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CommitNode {
-    pub commit: CommitData,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CommitsConnection {
-    #[serde(default)]
-    pub nodes: Vec<Option<CommitNode>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct PrNode {
     pub number: u64,
     pub title: String,
@@ -85,12 +62,12 @@ pub struct PrNode {
     pub created_at: String,
     pub updated_at: String,
     pub review_decision: Option<String>,
+    #[serde(default)]
+    pub head_ref_oid: String,
     pub author: Option<ActorNode>,
     pub repository: RepoNode,
     pub comments: CommentsConnection,
     pub review_threads: TotalCount,
-    #[serde(default)]
-    pub commits: Option<CommitsConnection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,4 +85,28 @@ pub struct RepoNode {
 #[derive(Debug, Deserialize)]
 pub struct RepoOwnerNode {
     pub login: String,
+}
+
+// --- REST API types for CI status fetch ---
+
+#[derive(Debug, Deserialize)]
+pub struct CombinedStatusResponse {
+    pub state: String,
+    #[serde(default)]
+    pub statuses: Vec<serde::de::IgnoredAny>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CheckRunsResponse {
+    #[serde(default)]
+    pub total_count: u64,
+    #[serde(default)]
+    pub check_runs: Vec<CheckRun>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CheckRun {
+    pub status: String,
+    pub conclusion: Option<String>,
 }

@@ -74,4 +74,4 @@ CLI args > env vars (`GITHUB_TOKEN`, `GITHUB_USERNAME`) > `~/.config/prtop/confi
 
 Config keys: `github_token`, `username`, `poll_interval_secs`, `[notify].enabled`, `[notify].events`
 
-`[notify].events` accepts a list of event names: `review_requested`, `pr_closed`, `pr_merged`, `re_review_requested`, `new_comment`, `ci_finished`. Omitting `events` enables all except `ci_finished` (requires Contents read PAT permission; opt-in). `enabled = false` is a global kill switch.
+`[notify].events` accepts a list of event names: `review_requested`, `pr_closed`, `pr_merged`, `re_review_requested`, `new_comment`, `ci_finished`. Omitting `events` enables all except `ci_finished` (opt-in: it issues per-PR REST calls each poll and needs `commit_statuses: read` and/or `checks: read` on the PAT). `enabled = false` is a global kill switch.

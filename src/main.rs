@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use app::{App, Message};
-use config::Config;
+use config::{Config, NotifyEvent};
 use github::client::GitHubClient;
 use notify::build_notifier;
 
@@ -57,6 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let error_tx = msg_tx.clone();
     let username = config.username.clone();
     let interval = Duration::from_secs(config.poll_interval_secs);
+    let fetch_ci = config.notify_events.contains(&NotifyEvent::CiFinished);
 
     tokio::spawn(async move {
         let error_sender = {
@@ -86,6 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             client,
             username,
             interval,
+            fetch_ci,
             poll_sender,
             error_sender,
             poll_cancel,

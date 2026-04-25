@@ -16,59 +16,7 @@ query($query: String!, $first: Int!, $after: String) {
         createdAt
         updatedAt
         reviewDecision
-        author {
-          login
-        }
-        repository {
-          name
-          owner {
-            login
-          }
-        }
-        comments(last: 1) {
-          totalCount
-          nodes {
-            author {
-              login
-            }
-          }
-        }
-        reviewThreads {
-          totalCount
-        }
-        commits(last: 1) {
-          nodes {
-            commit {
-              statusCheckRollup {
-                state
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-"#;
-
-pub const SEARCH_PRS_QUERY_BASIC: &str = r#"
-query($query: String!, $first: Int!, $after: String) {
-  search(query: $query, type: ISSUE, first: $first, after: $after) {
-    issueCount
-    pageInfo {
-      hasNextPage
-      endCursor
-    }
-    nodes {
-      ... on PullRequest {
-        number
-        title
-        url
-        state
-        isDraft
-        createdAt
-        updatedAt
-        reviewDecision
+        headRefOid
         author {
           login
         }
