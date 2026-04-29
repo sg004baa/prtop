@@ -110,7 +110,8 @@ impl App {
                 if self.prs.is_empty() {
                     return;
                 }
-                let i = match self.list_state.selected() {
+                let prev_id = self.selected_id();
+                let target = match self.list_state.selected() {
                     Some(i) => {
                         if i == 0 {
                             self.prs.len() - 1
@@ -120,8 +121,7 @@ impl App {
                     }
                     None => 0,
                 };
-                self.list_state.select(Some(i));
-                self.dismiss_if_done(i);
+                self.move_focus_to(target, prev_id);
                 self.last_activity = Some(Instant::now());
                 self.dirty = true;
             }
@@ -129,7 +129,8 @@ impl App {
                 if self.prs.is_empty() {
                     return;
                 }
-                let i = match self.list_state.selected() {
+                let prev_id = self.selected_id();
+                let target = match self.list_state.selected() {
                     Some(i) => {
                         if i >= self.prs.len() - 1 {
                             0
@@ -139,8 +140,7 @@ impl App {
                     }
                     None => 0,
                 };
-                self.list_state.select(Some(i));
-                self.dismiss_if_done(i);
+                self.move_focus_to(target, prev_id);
                 self.last_activity = Some(Instant::now());
                 self.dirty = true;
             }
@@ -172,8 +172,9 @@ impl App {
                 self.dirty = true;
             }
             Message::Deselect => {
-                if self.list_state.selected().is_some() {
+                if let Some(prev_id) = self.selected_id() {
                     self.list_state.select(None);
+                    self.dismiss_if_done(&prev_id);
                     self.dirty = true;
                 }
             }
@@ -322,26 +323,49 @@ impl App {
         }
     }
 
-    /// フォーカスされた PR が closed/merged なら即座にリストから削除する。
-    fn dismiss_if_done(&mut self, i: usize) {
-        let info = self.prs.get_index(i).map(|(id, pr)| {
-            (
-                id.clone(),
-                matches!(pr.state, PrState::Closed | PrState::Merged),
-            )
-        });
-        if let Some((id, is_done)) = info {
-            self.new_pr_ids.remove(&id);
-            self.new_comment_pr_ids.remove(&id);
-            if is_done {
-                self.dismissed_ids.insert(id.clone());
-                self.prs.shift_remove(&id);
-                if self.prs.is_empty() {
-                    self.list_state.select(None);
-                } else {
-                    self.list_state.select(Some(i.min(self.prs.len() - 1)));
-                }
+    fn selected_id(&self) -> Option<PrId> {
+        self.list_state
+            .selected()
+            .and_then(|i| self.prs.get_index(i).map(|(id, _)| id.clone()))
+    }
+
+    /// 新しい PR にフォーカス移動する。
+    /// - 直前にフォーカスしていた `prev_id` が closed/merged ならリストから削除する。
+    /// - 移動先の PR の new/comment マーカーをクリアする。
+    /// - インデックスは削除でずれるため、移動先 PR を ID で再解決して select する。
+    /// - `prev_id` と移動先が同じ PR の場合（PR が 1 件だけのラップ等）は dismiss しない。
+    fn move_focus_to(&mut self, target_idx: usize, prev_id: Option<PrId>) {
+        let target_id = self.prs.get_index(target_idx).map(|(id, _)| id.clone());
+
+        if let (Some(prev_id), Some(target_id)) = (prev_id.as_ref(), target_id.as_ref())
+            && prev_id != target_id
+        {
+            self.dismiss_if_done(prev_id);
+        }
+
+        if let Some(target_id) = target_id {
+            self.new_pr_ids.remove(&target_id);
+            self.new_comment_pr_ids.remove(&target_id);
+            if let Some(idx) = self.prs.get_index_of(&target_id) {
+                self.list_state.select(Some(idx));
+                return;
             }
+        }
+
+        if self.prs.is_empty() {
+            self.list_state.select(None);
+        }
+    }
+
+    /// `id` の PR が closed/merged ならリストから削除し、再ポーリングで再登場しないよう dismiss 集合に積む。
+    fn dismiss_if_done(&mut self, id: &PrId) {
+        let is_done = self
+            .prs
+            .get(id)
+            .is_some_and(|pr| matches!(pr.state, PrState::Closed | PrState::Merged));
+        if is_done {
+            self.dismissed_ids.insert(id.clone());
+            self.prs.shift_remove(id);
         }
     }
 
@@ -591,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_on_closed_pr_removes_it() {
+    fn focus_on_closed_pr_keeps_it_until_blur() {
         let mut app = App::new(
             "testuser".to_string(),
             ColorScheme::default(),
@@ -628,31 +652,98 @@ mod tests {
         app.update(Message::MoveDown);
         assert_eq!(app.prs.len(), 2);
 
-        // Focus index 1 (closed) - gets removed
+        // Focus index 1 (closed) - still selectable, list unchanged
+        app.update(Message::MoveDown);
+        assert_eq!(app.prs.len(), 2);
+        assert_eq!(app.list_state.selected(), Some(1));
+
+        // Move away from the closed PR - now it gets dismissed
         app.update(Message::MoveDown);
         assert_eq!(app.prs.len(), 1);
         assert!(app.prs.contains_key(&id_open));
         assert!(!app.prs.contains_key(&id_closed));
+        assert_eq!(app.list_state.selected(), Some(0));
     }
 
     #[test]
-    fn focus_on_merged_pr_removes_it() {
+    fn focus_on_merged_pr_keeps_it_until_deselect() {
         let mut app = App::new(
             "testuser".to_string(),
             ColorScheme::default(),
             NotifyEvent::all(),
         );
         let id_merged = make_id(1);
+
+        // Initial poll: PR is open
         let mut prs = IndexMap::new();
         prs.insert(
             id_merged.clone(),
-            make_merged_pr(&id_merged, PrRole::Author, 0),
+            make_pr_custom(&id_merged, PrRole::Author, None, 0),
         );
         app.update(Message::PollResult(payload_from(prs)));
 
+        // Second poll: PR transitions to merged
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id_merged.clone(),
+            make_merged_pr(&id_merged, PrRole::Author, 100),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        // Focus the merged PR - stays in the list so the user can review it
         app.update(Message::MoveDown);
+        assert_eq!(app.prs.len(), 1);
+        assert_eq!(app.list_state.selected(), Some(0));
+
+        // Deselect drops focus and dismisses the merged PR
+        app.update(Message::Deselect);
         assert!(app.prs.is_empty());
         assert_eq!(app.list_state.selected(), None);
+    }
+
+    #[test]
+    fn move_away_from_merged_pr_removes_it() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id_open = make_id(1);
+        let id_merged = make_id(2);
+
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id_open.clone(),
+            make_pr_custom(&id_open, PrRole::Author, None, 0),
+        );
+        prs.insert(
+            id_merged.clone(),
+            make_pr_custom(&id_merged, PrRole::Author, None, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id_open.clone(),
+            make_pr_custom(&id_open, PrRole::Author, None, 0),
+        );
+        prs2.insert(
+            id_merged.clone(),
+            make_merged_pr(&id_merged, PrRole::Author, 100),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        // Step onto the merged PR
+        app.update(Message::MoveDown);
+        app.update(Message::MoveDown);
+        assert_eq!(app.prs.len(), 2);
+        assert_eq!(app.list_state.selected(), Some(1));
+
+        // Step back up — merged PR is dismissed, focus lands on the open one
+        app.update(Message::MoveUp);
+        assert_eq!(app.prs.len(), 1);
+        assert!(!app.prs.contains_key(&id_merged));
+        assert_eq!(app.list_state.selected(), Some(0));
     }
 
     #[test]
@@ -796,7 +887,8 @@ mod tests {
         );
         app.update(Message::PollResult(payload_from(prs2)));
 
-        // Focus the closed PR → gets dismissed
+        // Focus the closed PR, then move away → gets dismissed on blur
+        app.update(Message::MoveDown);
         app.update(Message::MoveDown);
         app.update(Message::MoveDown);
         assert!(!app.prs.contains_key(&id_closed));
@@ -846,8 +938,9 @@ mod tests {
         );
         app.update(Message::PollResult(payload_from(prs2)));
 
-        // Focus the closed reviewer PR → dismissed
+        // Focus the closed reviewer PR, then deselect → dismissed
         app.update(Message::MoveDown);
+        app.update(Message::Deselect);
         assert!(app.dismissed_ids.contains(&id));
 
         // Clear any notifications from the transition poll
