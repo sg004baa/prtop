@@ -118,12 +118,10 @@ async fn enrich_with_ci_status(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn polling_loop(
     client: GitHubClient,
     username: String,
     interval: Duration,
-    fetch_ci: bool,
     tx: mpsc::Sender<PollPayload>,
     error_tx: mpsc::Sender<String>,
     cancel: CancellationToken,
@@ -132,7 +130,7 @@ pub async fn polling_loop(
     let mut backoff_secs = 0u64;
 
     loop {
-        let result = poll_once(&client, &username, fetch_ci).await;
+        let result = poll_once(&client, &username).await;
 
         match result {
             Ok(payload) => {
@@ -177,11 +175,7 @@ pub async fn polling_loop(
     }
 }
 
-async fn poll_once(
-    client: &GitHubClient,
-    username: &str,
-    fetch_ci: bool,
-) -> Result<PollPayload, AppError> {
+async fn poll_once(client: &GitHubClient, username: &str) -> Result<PollPayload, AppError> {
     let author_open_query = query::author_search_query(username);
     let author_closed_query = query::author_closed_search_query(username);
     let review_open_query = query::review_requested_search_query(username);
@@ -205,9 +199,7 @@ async fn poll_once(
 
     let (mut prs, shas) = merge_and_convert(author_nodes, review_nodes);
 
-    if fetch_ci {
-        enrich_with_ci_status(client, &mut prs, shas).await;
-    }
+    enrich_with_ci_status(client, &mut prs, shas).await;
 
     Ok(PollPayload {
         prs,
@@ -417,7 +409,6 @@ mod tests {
                 client,
                 "user".to_string(),
                 Duration::from_secs(3600),
-                false,
                 tx,
                 err_tx,
                 cancel_clone,
@@ -460,7 +451,6 @@ mod tests {
                 client,
                 "user".to_string(),
                 Duration::from_secs(60),
-                false,
                 tx,
                 err_tx,
                 cancel_clone,
@@ -507,7 +497,6 @@ mod tests {
                 client,
                 "user".to_string(),
                 Duration::from_secs(3600),
-                false,
                 tx,
                 err_tx,
                 cancel_clone,

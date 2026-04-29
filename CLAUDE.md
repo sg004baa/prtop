@@ -74,4 +74,4 @@ CLI args > env vars (`GITHUB_TOKEN`, `GITHUB_USERNAME`) > `~/.config/prtop/confi
 
 Config keys: `github_token`, `username`, `poll_interval_secs`, `[notify].enabled`, plus per-event toggles under `[notify]`.
 
-Per-event toggles: `review_requested`, `pr_closed`, `pr_merged`, `re_review_requested`, `new_comment`, `ci_finished`. All default `true` except `ci_finished` (default `false`). Omit a key to use its default. `enabled = false` is a global kill switch (defaults to `false`). `ci_finished` is opt-in because it issues per-PR REST calls each poll and needs `commit_statuses: read` and/or `checks: read` on the PAT.
+Per-event toggles: `review_requested`, `pr_closed`, `pr_merged`, `re_review_requested`, `new_comment`, `ci_finished`. All default `true` except `ci_finished` (default `false`). Omit a key to use its default. `enabled = false` is a global kill switch (defaults to `false`). `ci_finished` only controls the notification — CI status is always fetched per poll to populate the `CI` column. Token needs `commit_statuses: read` and/or `checks: read` to actually see CI state; without those scopes the calls 403/404 silently.

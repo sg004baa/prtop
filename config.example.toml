@@ -17,9 +17,10 @@ poll_interval_secs = 60
 #   ✅ new_comment         — Comment count increases on your authored PR
 #   ❌ ci_finished         — CI transitions from in-progress to success/failure
 #
-# `ci_finished` is opt-in because each poll issues per-PR REST calls to
-# /repos/{owner}/{repo}/commits/{sha}/status and /check-runs. Requires
-# `Commit statuses: Read-only` and/or `Checks: Read-only` on the token.
+# `ci_finished` controls only whether a notification fires on CI transitions;
+# the CI column itself is always populated. Token needs
+# `Commit statuses: Read-only` and/or `Checks: Read-only` to read CI state —
+# without them the column silently shows `-` for every PR.
 [notify]
 enabled = false
 # review_requested    = true

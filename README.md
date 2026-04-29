@@ -76,11 +76,16 @@ enabled = true
 | `new_comment`         |    ✅    | Comment count increases on your authored PR (self-comment skip) |
 | `ci_finished`         |    ❌    | CI transitions from in-progress to success/failure (author/both) |
 
-`ci_finished` is opt-in because each poll issues per-PR REST calls to
-`/repos/{owner}/{repo}/commits/{sha}/status` and `/check-runs`. The token
-needs **Commit statuses: Read-only** and/or **Checks: Read-only** in addition
-to the base scopes. Without those scopes the per-PR calls 403/404 and CI
-notifications silently never fire.
+CI status is fetched every poll (per-PR REST calls to
+`/repos/{owner}/{repo}/commits/{sha}/status` and `/check-runs`) and shown in
+the `CI` column regardless of `ci_finished`. The token needs
+**Commit statuses: Read-only** and/or **Checks: Read-only** in addition to
+the base scopes; without them the calls 403/404 silently and the `CI` column
+shows `-` for every PR.
+
+`ci_finished` controls only whether a *notification* fires when CI
+transitions from in-progress to success/failure. It defaults off because CI
+flapping can be noisy.
 
 ## Color Scheme
 
