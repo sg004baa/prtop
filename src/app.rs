@@ -10,7 +10,7 @@ use crate::config::NotifyEvent;
 use crate::diff::diff_pr_sets;
 use crate::notify::Notification;
 use crate::poller::PollPayload;
-use crate::types::{PrId, PrRole, PrState, PullRequest, ReviewDecision};
+use crate::types::{CiStatus, PrId, PrRole, PrState, PullRequest, ReviewDecision};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Screen {
@@ -271,6 +271,28 @@ impl App {
                             self.new_comment_pr_ids.insert(id.clone());
                         }
                     }
+
+                    // CI status change: notify author when CI transitions from in-progress to finished
+                    for (id, new_pr) in &incoming {
+                        if let Some(old_pr) = self.prs.get(id)
+                            && matches!(new_pr.role, PrRole::Author | PrRole::Both)
+                            && old_pr
+                                .ci_status
+                                .as_ref()
+                                .is_some_and(CiStatus::is_in_progress)
+                            && new_pr.ci_status.as_ref().is_some_and(CiStatus::is_finished)
+                            && self.notify_events.contains(&NotifyEvent::CiFinished)
+                        {
+                            let title = match new_pr.ci_status {
+                                Some(CiStatus::Success) => "CI passed",
+                                _ => "CI failed",
+                            };
+                            self.pending_notifications.push(Notification {
+                                title: title.to_string(),
+                                body: format!("{} ({})", new_pr.title, id),
+                            });
+                        }
+                    }
                 }
 
                 if already_loaded {
@@ -375,6 +397,7 @@ mod tests {
             review_decision,
             total_comments,
             last_commenter: None,
+            ci_status: None,
         }
     }
 
@@ -1432,5 +1455,221 @@ mod tests {
         );
         app.update(Message::PollResult(payload_from(prs)));
         assert!(app.pending_notifications.is_empty());
+    }
+
+    // --- CI finished notification ---
+
+    fn make_pr_with_ci(
+        id: &PrId,
+        role: PrRole,
+        updated_secs: i64,
+        ci_status: Option<CiStatus>,
+    ) -> PullRequest {
+        PullRequest {
+            ci_status,
+            ..make_pr_with_comments(id, role, None, updated_secs, 0)
+        }
+    }
+
+    #[test]
+    fn ci_pending_to_success_triggers_notification() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 0, Some(CiStatus::Pending)),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 100, Some(CiStatus::Success)),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert_eq!(app.pending_notifications.len(), 1);
+        assert_eq!(app.pending_notifications[0].title, "CI passed");
+    }
+
+    #[test]
+    fn ci_pending_to_failure_triggers_notification() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 0, Some(CiStatus::Pending)),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 100, Some(CiStatus::Failure)),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert_eq!(app.pending_notifications.len(), 1);
+        assert_eq!(app.pending_notifications[0].title, "CI failed");
+    }
+
+    #[test]
+    fn ci_success_to_success_no_notification() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 0, Some(CiStatus::Success)),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 100, Some(CiStatus::Success)),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(app.pending_notifications.is_empty());
+    }
+
+    #[test]
+    fn ci_none_to_success_no_notification() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(id.clone(), make_pr_with_ci(&id, PrRole::Author, 0, None));
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 100, Some(CiStatus::Success)),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(
+            app.pending_notifications.is_empty(),
+            "no notification when old ci_status is None"
+        );
+    }
+
+    #[test]
+    fn ci_notification_only_for_author() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::ReviewRequested, 0, Some(CiStatus::Pending)),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::ReviewRequested, 100, Some(CiStatus::Success)),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(
+            app.pending_notifications.is_empty(),
+            "reviewer should not get CI notification"
+        );
+    }
+
+    #[test]
+    fn ci_notification_for_both_role() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Both, 0, Some(CiStatus::Pending)),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Both, 100, Some(CiStatus::Failure)),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert_eq!(app.pending_notifications.len(), 1);
+        assert_eq!(app.pending_notifications[0].title, "CI failed");
+    }
+
+    #[test]
+    fn disabled_ci_finished_suppresses_notification() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            events_except(NotifyEvent::CiFinished),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 0, Some(CiStatus::Pending)),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 100, Some(CiStatus::Success)),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(app.pending_notifications.is_empty());
+    }
+
+    #[test]
+    fn ci_no_notification_on_first_poll() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 0, Some(CiStatus::Success)),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        assert!(
+            app.pending_notifications.is_empty(),
+            "no CI notification on initial load"
+        );
     }
 }

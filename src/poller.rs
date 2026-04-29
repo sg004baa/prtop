@@ -1,9 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::AppError;
@@ -26,13 +27,16 @@ fn parse_state(s: &str) -> PrState {
     }
 }
 
-fn node_to_pr(node: PrNode, role: PrRole) -> PullRequest {
+/// Convert a GraphQL PR node to a domain PullRequest. `ci_status` is left `None`;
+/// it is populated by [`enrich_with_ci_status`] in a separate REST call.
+fn node_to_pr(node: PrNode, role: PrRole) -> (PullRequest, String) {
     let id = PrId {
         owner: node.repository.owner.login,
         repo: node.repository.name,
         number: node.number,
     };
-    PullRequest {
+    let head_sha = node.head_ref_oid;
+    let pr = PullRequest {
         id,
         title: node.title,
         url: node.url,
@@ -50,34 +54,68 @@ fn node_to_pr(node: PrNode, role: PrRole) -> PullRequest {
             .first()
             .and_then(|c| c.author.as_ref())
             .map(|a| a.login.clone()),
-    }
+        ci_status: None,
+    };
+    (pr, head_sha)
 }
 
 pub fn merge_and_convert(
     author_nodes: Vec<PrNode>,
     review_nodes: Vec<PrNode>,
-) -> IndexMap<PrId, PullRequest> {
+) -> (IndexMap<PrId, PullRequest>, HashMap<PrId, String>) {
     let mut result = IndexMap::new();
+    let mut shas: HashMap<PrId, String> = HashMap::new();
 
     let mut author_ids: HashSet<PrId> = HashSet::new();
     for node in author_nodes {
-        let pr = node_to_pr(node, PrRole::Author);
+        let (pr, sha) = node_to_pr(node, PrRole::Author);
         author_ids.insert(pr.id.clone());
+        shas.insert(pr.id.clone(), sha);
         result.insert(pr.id.clone(), pr);
     }
 
     for node in review_nodes {
-        let pr = node_to_pr(node, PrRole::ReviewRequested);
+        let (pr, sha) = node_to_pr(node, PrRole::ReviewRequested);
         if author_ids.contains(&pr.id) {
             if let Some(existing) = result.get_mut(&pr.id) {
                 existing.role = PrRole::Both;
             }
         } else {
+            shas.insert(pr.id.clone(), sha);
             result.insert(pr.id.clone(), pr);
         }
     }
 
-    result
+    (result, shas)
+}
+
+/// Fetch CI status for every PR in parallel and assign `ci_status`.
+/// Errors for individual PRs are swallowed (best-effort enrichment).
+async fn enrich_with_ci_status(
+    client: &GitHubClient,
+    prs: &mut IndexMap<PrId, PullRequest>,
+    shas: HashMap<PrId, String>,
+) {
+    let mut joinset: JoinSet<(PrId, Option<crate::types::CiStatus>)> = JoinSet::new();
+    for (id, sha) in shas {
+        if sha.is_empty() {
+            continue;
+        }
+        let client = client.clone();
+        joinset.spawn(async move {
+            let ci = client
+                .fetch_ci_status(&id.owner, &id.repo, &sha)
+                .await
+                .unwrap_or(None);
+            (id, ci)
+        });
+    }
+    while let Some(res) = joinset.join_next().await {
+        let Ok((id, ci)) = res else { continue };
+        if let Some(pr) = prs.get_mut(&id) {
+            pr.ci_status = ci;
+        }
+    }
 }
 
 pub async fn polling_loop(
@@ -159,7 +197,9 @@ async fn poll_once(client: &GitHubClient, username: &str) -> Result<PollPayload,
     let mut review_nodes = review_open?;
     review_nodes.extend(review_closed?);
 
-    let prs = merge_and_convert(author_nodes, review_nodes);
+    let (mut prs, shas) = merge_and_convert(author_nodes, review_nodes);
+
+    enrich_with_ci_status(client, &mut prs, shas).await;
 
     Ok(PollPayload {
         prs,
@@ -187,6 +227,7 @@ mod tests {
             created_at: "2024-01-01T00:00:00Z".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             review_decision: None,
+            head_ref_oid: String::new(),
             author: Some(ActorNode {
                 login: "user".to_string(),
             }),
@@ -208,7 +249,7 @@ mod tests {
     fn merge_author_only() {
         let author = vec![make_node("org", "repo", 1)];
         let review = vec![];
-        let result = merge_and_convert(author, review);
+        let (result, _) = merge_and_convert(author, review);
         assert_eq!(result.len(), 1);
         let pr = result.values().next().unwrap();
         assert_eq!(pr.role, PrRole::Author);
@@ -218,7 +259,7 @@ mod tests {
     fn merge_review_only() {
         let author = vec![];
         let review = vec![make_node("org", "repo", 1)];
-        let result = merge_and_convert(author, review);
+        let (result, _) = merge_and_convert(author, review);
         assert_eq!(result.len(), 1);
         let pr = result.values().next().unwrap();
         assert_eq!(pr.role, PrRole::ReviewRequested);
@@ -228,7 +269,7 @@ mod tests {
     fn merge_both_roles() {
         let author = vec![make_node("org", "repo", 1)];
         let review = vec![make_node("org", "repo", 1)];
-        let result = merge_and_convert(author, review);
+        let (result, _) = merge_and_convert(author, review);
         assert_eq!(result.len(), 1);
         let pr = result.values().next().unwrap();
         assert_eq!(pr.role, PrRole::Both);
@@ -238,7 +279,7 @@ mod tests {
     fn merge_distinct_prs() {
         let author = vec![make_node("org", "repo", 1)];
         let review = vec![make_node("org", "repo", 2)];
-        let result = merge_and_convert(author, review);
+        let (result, _) = merge_and_convert(author, review);
         assert_eq!(result.len(), 2);
     }
 
@@ -263,7 +304,7 @@ mod tests {
     fn node_to_pr_author_none_gives_empty_string() {
         let mut node = make_node("org", "repo", 1);
         node.author = None;
-        let pr = node_to_pr(node, PrRole::Author);
+        let (pr, _) = node_to_pr(node, PrRole::Author);
         assert_eq!(pr.author_login, "");
     }
 
@@ -272,7 +313,7 @@ mod tests {
         let mut node = make_node("org", "repo", 1);
         node.created_at = "not-a-timestamp".to_string();
         node.updated_at = "also-invalid".to_string();
-        let pr = node_to_pr(node, PrRole::Author);
+        let (pr, _) = node_to_pr(node, PrRole::Author);
         assert_eq!(pr.created_at, DateTime::<Utc>::default());
         assert_eq!(pr.updated_at, DateTime::<Utc>::default());
     }
@@ -281,7 +322,7 @@ mod tests {
     fn node_to_pr_unknown_review_decision() {
         let mut node = make_node("org", "repo", 1);
         node.review_decision = Some("FUTURE_DECISION".to_string());
-        let pr = node_to_pr(node, PrRole::Author);
+        let (pr, _) = node_to_pr(node, PrRole::Author);
         assert_eq!(
             pr.review_decision,
             Some(ReviewDecision::Unknown("FUTURE_DECISION".to_string()))
@@ -302,7 +343,7 @@ mod tests {
                 }),
             }],
         };
-        let pr = node_to_pr(node, PrRole::Author);
+        let (pr, _) = node_to_pr(node, PrRole::Author);
         assert_eq!(pr.last_commenter.as_deref(), Some("reviewer1"));
         assert_eq!(pr.total_comments, 5); // review_threads(0) + comments(5)
     }
@@ -310,7 +351,7 @@ mod tests {
     #[test]
     fn node_to_pr_empty_comments_gives_none() {
         let node = make_node("org", "repo", 1);
-        let pr = node_to_pr(node, PrRole::Author);
+        let (pr, _) = node_to_pr(node, PrRole::Author);
         assert_eq!(pr.last_commenter, None);
     }
 
@@ -322,8 +363,16 @@ mod tests {
             total_count: 2,
             nodes: vec![CommentNode { author: None }],
         };
-        let pr = node_to_pr(node, PrRole::Author);
+        let (pr, _) = node_to_pr(node, PrRole::Author);
         assert_eq!(pr.last_commenter, None);
+    }
+
+    #[test]
+    fn node_to_pr_propagates_head_sha() {
+        let mut node = make_node("org", "repo", 1);
+        node.head_ref_oid = "deadbeef".to_string();
+        let (_, sha) = node_to_pr(node, PrRole::Author);
+        assert_eq!(sha, "deadbeef");
     }
 
     // --- polling_loop async control ---

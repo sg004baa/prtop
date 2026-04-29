@@ -31,7 +31,12 @@
               { "author": { "login": "reviewer1" } }
             ]
           },
-          "reviewThreads": { "totalCount": 1 }
+          "reviewThreads": { "totalCount": 1 },
+          "commits": {
+            "nodes": [
+              { "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }
+            ]
+          }
         },
         {
           "number": 5678,
@@ -52,7 +57,12 @@
             }
           },
           "comments": { "totalCount": 0 },
-          "reviewThreads": { "totalCount": 0 }
+          "reviewThreads": { "totalCount": 0 },
+          "commits": {
+            "nodes": [
+              { "commit": { "statusCheckRollup": null } }
+            ]
+          }
         }
       ]
     }

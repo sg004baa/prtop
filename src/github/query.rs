@@ -16,6 +16,7 @@ query($query: String!, $first: Int!, $after: String) {
         createdAt
         updatedAt
         reviewDecision
+        headRefOid
         author {
           login
         }

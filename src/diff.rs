@@ -60,6 +60,7 @@ mod tests {
             review_decision: None,
             total_comments: 0,
             last_commenter: None,
+            ci_status: None,
         };
         (id, pr)
     }

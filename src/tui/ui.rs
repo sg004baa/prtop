@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, HighlightSpacing, List, ListItem, Paragraph};
 
 use crate::app::{App, LoadingState, Screen};
-use crate::types::{PrRole, PrState};
+use crate::types::{CiStatus, PrRole, PrState};
 
 pub fn view(f: &mut Frame, app: &mut App) {
     match app.screen {
@@ -14,15 +14,16 @@ pub fn view(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// Returns (role, status, number, repo, title) column widths based on actual PR data lengths.
-/// Layout: [▸ ][role][  ][status][  ][number][title][  ][repo]
-fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize, usize) {
+/// Returns (role, status, ci, number, repo, title) column widths based on actual PR data lengths.
+/// Layout: [▸ ][role][  ][status][  ][ci][  ][number][title][  ][repo]
+fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize, usize, usize) {
     let effective = (term_width as usize).saturating_sub(2); // 2 for "▸ " / "  "
     let role: usize = 6; // "AUTHOR", "REVIEW", "BOTH  "
     let status: usize = 6; // "OPEN  ", "CLOSED", "MERGED"
+    let ci: usize = 3; // "✓  ", "×  ", "...", "-  "
     let number: usize = 7; // "#12345 "
-    let seps: usize = 6; // "  " after role, after status, after title
-    let fixed = role + status + seps + number;
+    let seps: usize = 8; // "  " after role/status/ci/title
+    let fixed = role + status + ci + seps + number;
     let remaining = effective.saturating_sub(fixed);
 
     let max_repo = app
@@ -45,7 +46,7 @@ fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize, usize)
         let title = remaining.saturating_sub(repo);
         (repo, title)
     };
-    (role, status, number, repo, title)
+    (role, status, ci, number, repo, title)
 }
 
 fn pr_list_area(f: &Frame, app: &App) -> Rect {
@@ -113,9 +114,9 @@ fn render_col_header(
     f: &mut Frame,
     app: &App,
     area: Rect,
-    widths: (usize, usize, usize, usize, usize),
+    widths: (usize, usize, usize, usize, usize, usize),
 ) {
-    let (role_w, status_w, num_w, repo_w, title_w) = widths;
+    let (role_w, status_w, ci_w, num_w, repo_w, title_w) = widths;
     let style = Style::default()
         .fg(app.colors.col_header)
         .add_modifier(Modifier::BOLD);
@@ -124,6 +125,8 @@ fn render_col_header(
         Span::styled(format!("{:<width$}", "ROLE", width = role_w), style),
         Span::raw("  "),
         Span::styled(format!("{:<width$}", "STATUS", width = status_w), style),
+        Span::raw("  "),
+        Span::styled(format!("{:<width$}", "CI", width = ci_w), style),
         Span::raw("  "),
         Span::styled(format!("{:<width$}", "#", width = num_w), style),
         Span::styled(format!("{:<width$}", "TITLE", width = title_w), style),
@@ -137,7 +140,7 @@ fn render_list(
     f: &mut Frame,
     app: &mut App,
     area: Rect,
-    widths: (usize, usize, usize, usize, usize),
+    widths: (usize, usize, usize, usize, usize, usize),
 ) {
     match &app.loading {
         LoadingState::Initial | LoadingState::Loading => {
@@ -160,7 +163,7 @@ fn render_list(
         return;
     }
 
-    let (role_w, status_w, num_w, repo_w, title_w) = widths;
+    let (role_w, status_w, ci_w, num_w, repo_w, title_w) = widths;
 
     let items: Vec<ListItem> = app
         .prs
@@ -194,6 +197,7 @@ fn render_list(
                 Style::default()
             };
 
+            let (ci_tag, ci_style) = ci_cell(pr.ci_status.as_ref());
             let line = Line::from(vec![
                 Span::styled(
                     format!("{:<width$}", role_tag, width = role_w),
@@ -204,6 +208,8 @@ fn render_list(
                     format!("{:<width$}", status_tag, width = status_w),
                     status_style,
                 ),
+                Span::raw("  "),
+                Span::styled(format!("{:<width$}", ci_tag, width = ci_w), ci_style),
                 Span::raw("  "),
                 Span::styled(
                     format!("{:<width$}", number_display, width = num_w),
@@ -286,6 +292,15 @@ fn render_help(f: &mut Frame, _app: &mut App) {
 
     let help = Paragraph::new(help_text).block(Block::default().title(" Help "));
     f.render_widget(help, f.area());
+}
+
+fn ci_cell(ci: Option<&CiStatus>) -> (&'static str, Style) {
+    match ci {
+        Some(CiStatus::Pending) => ("...", Style::default().fg(Color::Yellow)),
+        Some(CiStatus::Success) => ("✓", Style::default().fg(Color::Green)),
+        Some(CiStatus::Failure) => ("✗", Style::default().fg(Color::Red)),
+        None => ("-", Style::default().fg(Color::DarkGray)),
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
