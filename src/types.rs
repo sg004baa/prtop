@@ -46,6 +46,23 @@ impl ReviewDecision {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CiStatus {
+    Pending,
+    Success,
+    Failure,
+}
+
+impl CiStatus {
+    pub fn is_in_progress(&self) -> bool {
+        matches!(self, CiStatus::Pending)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        matches!(self, CiStatus::Success | CiStatus::Failure)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PullRequest {
     pub id: PrId,
@@ -62,6 +79,7 @@ pub struct PullRequest {
     pub review_decision: Option<ReviewDecision>,
     pub total_comments: u64,
     pub last_commenter: Option<String>,
+    pub ci_status: Option<CiStatus>,
 }
 
 #[cfg(test)]
@@ -109,5 +127,21 @@ mod tests {
             number: 42,
         };
         assert_eq!(id.to_string(), "org/repo#42");
+    }
+
+    // --- CiStatus ---
+
+    #[test]
+    fn ci_status_in_progress() {
+        assert!(CiStatus::Pending.is_in_progress());
+        assert!(!CiStatus::Success.is_in_progress());
+        assert!(!CiStatus::Failure.is_in_progress());
+    }
+
+    #[test]
+    fn ci_status_finished() {
+        assert!(CiStatus::Success.is_finished());
+        assert!(CiStatus::Failure.is_finished());
+        assert!(!CiStatus::Pending.is_finished());
     }
 }

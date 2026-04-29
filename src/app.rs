@@ -6,10 +6,11 @@ use indexmap::IndexMap;
 use ratatui::widgets::ListState;
 
 use crate::colors::ColorScheme;
+use crate::config::NotifyEvent;
 use crate::diff::diff_pr_sets;
 use crate::notify::Notification;
 use crate::poller::PollPayload;
-use crate::types::{PrId, PrRole, PrState, PullRequest, ReviewDecision};
+use crate::types::{CiStatus, PrId, PrRole, PrState, PullRequest, ReviewDecision};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Screen {
@@ -53,12 +54,13 @@ pub struct App {
     pub dirty: bool,
     pub last_activity: Option<Instant>,
     pub pending_notifications: Vec<Notification>,
+    pub notify_events: HashSet<NotifyEvent>,
     pub colors: ColorScheme,
     pub username: String,
 }
 
 impl App {
-    pub fn new(username: String, colors: ColorScheme) -> Self {
+    pub fn new(username: String, colors: ColorScheme, notify_events: HashSet<NotifyEvent>) -> Self {
         Self {
             prs: IndexMap::new(),
             list_state: ListState::default(),
@@ -74,6 +76,7 @@ impl App {
             dirty: true,
             last_activity: None,
             pending_notifications: Vec::new(),
+            notify_events,
             colors,
             username,
         }
@@ -202,6 +205,7 @@ impl App {
                     for id in &diff.added {
                         if let Some(pr) = incoming.get(id)
                             && pr.role != PrRole::Author
+                            && self.notify_events.contains(&NotifyEvent::ReviewRequested)
                         {
                             self.pending_notifications.push(Notification {
                                 title: "Review requested".to_string(),
@@ -219,14 +223,16 @@ impl App {
                                 && matches!(new_pr.state, PrState::Closed | PrState::Merged)
                                 && new_pr.role == PrRole::Author
                             {
-                                let title = match new_pr.state {
-                                    PrState::Merged => "PR merged",
-                                    _ => "PR closed",
+                                let (title, event) = match new_pr.state {
+                                    PrState::Merged => ("PR merged", NotifyEvent::PrMerged),
+                                    _ => ("PR closed", NotifyEvent::PrClosed),
                                 };
-                                self.pending_notifications.push(Notification {
-                                    title: title.to_string(),
-                                    body: format!("{} ({})", new_pr.title, id),
-                                });
+                                if self.notify_events.contains(&event) {
+                                    self.pending_notifications.push(Notification {
+                                        title: title.to_string(),
+                                        body: format!("{} ({})", new_pr.title, id),
+                                    });
+                                }
                             }
 
                             let old_decision = old_pr.review_decision.as_ref();
@@ -237,7 +243,9 @@ impl App {
                                         old_decision,
                                         Some(ReviewDecision::ReviewRequired)
                                     );
-                            if became_review_required {
+                            if became_review_required
+                                && self.notify_events.contains(&NotifyEvent::ReReviewRequested)
+                            {
                                 self.pending_notifications.push(Notification {
                                     title: "Re-review requested".to_string(),
                                     body: format!("{} ({})", new_pr.title, id),
@@ -254,11 +262,35 @@ impl App {
                             && matches!(new_pr.role, PrRole::Author | PrRole::Both)
                             && new_pr.last_commenter.as_deref() != Some(self.username.as_str())
                         {
+                            if self.notify_events.contains(&NotifyEvent::NewComment) {
+                                self.pending_notifications.push(Notification {
+                                    title: "New comment".to_string(),
+                                    body: format!("{} ({})", new_pr.title, id),
+                                });
+                            }
+                            self.new_comment_pr_ids.insert(id.clone());
+                        }
+                    }
+
+                    // CI status change: notify author when CI transitions from in-progress to finished
+                    for (id, new_pr) in &incoming {
+                        if let Some(old_pr) = self.prs.get(id)
+                            && matches!(new_pr.role, PrRole::Author | PrRole::Both)
+                            && old_pr
+                                .ci_status
+                                .as_ref()
+                                .is_some_and(CiStatus::is_in_progress)
+                            && new_pr.ci_status.as_ref().is_some_and(CiStatus::is_finished)
+                            && self.notify_events.contains(&NotifyEvent::CiFinished)
+                        {
+                            let title = match new_pr.ci_status {
+                                Some(CiStatus::Success) => "CI passed",
+                                _ => "CI failed",
+                            };
                             self.pending_notifications.push(Notification {
-                                title: "New comment".to_string(),
+                                title: title.to_string(),
                                 body: format!("{} ({})", new_pr.title, id),
                             });
-                            self.new_comment_pr_ids.insert(id.clone());
                         }
                     }
                 }
@@ -365,6 +397,7 @@ mod tests {
             review_decision,
             total_comments,
             last_commenter: None,
+            ci_status: None,
         }
     }
 
@@ -401,14 +434,22 @@ mod tests {
 
     #[test]
     fn quit_sets_flag() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         app.update(Message::Quit);
         assert!(app.should_quit);
     }
 
     #[test]
     fn poll_result_updates_prs() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         app.update(Message::PollResult(make_payload(3)));
         assert_eq!(app.prs.len(), 3);
         assert!(matches!(app.loading, LoadingState::Loaded));
@@ -417,7 +458,11 @@ mod tests {
 
     #[test]
     fn navigation_wraps() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         app.update(Message::PollResult(make_payload(3)));
         assert_eq!(app.list_state.selected(), None);
 
@@ -436,7 +481,11 @@ mod tests {
 
     #[test]
     fn toggle_help() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         assert_eq!(app.screen, Screen::PrList);
         app.update(Message::ToggleHelp);
         assert_eq!(app.screen, Screen::Help);
@@ -446,7 +495,11 @@ mod tests {
 
     #[test]
     fn poll_error_sets_state() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         app.update(Message::PollError("network error".to_string()));
         assert!(app.poll_error.is_some());
         assert!(matches!(app.loading, LoadingState::Error(_)));
@@ -456,7 +509,11 @@ mod tests {
 
     #[test]
     fn no_notifications_on_first_poll() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -469,7 +526,11 @@ mod tests {
 
     #[test]
     fn closed_author_pr_triggers_notification() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(id.clone(), make_pr_custom(&id, PrRole::Author, None, 0));
@@ -486,7 +547,11 @@ mod tests {
 
     #[test]
     fn merged_author_pr_triggers_notification() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(id.clone(), make_pr_custom(&id, PrRole::Author, None, 0));
@@ -502,7 +567,11 @@ mod tests {
 
     #[test]
     fn closed_reviewer_pr_no_notification() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -523,7 +592,11 @@ mod tests {
 
     #[test]
     fn focus_on_closed_pr_removes_it() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id_open = make_id(1);
         let id_closed = make_id(2);
 
@@ -564,7 +637,11 @@ mod tests {
 
     #[test]
     fn focus_on_merged_pr_removes_it() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id_merged = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -580,7 +657,11 @@ mod tests {
 
     #[test]
     fn added_reviewer_pr_triggers_notification() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         app.update(Message::PollResult(payload_from(IndexMap::new())));
         let id = make_id(1);
         let mut prs = IndexMap::new();
@@ -595,7 +676,11 @@ mod tests {
 
     #[test]
     fn added_author_pr_no_notification() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         app.update(Message::PollResult(payload_from(IndexMap::new())));
         let id = make_id(1);
         let mut prs = IndexMap::new();
@@ -606,7 +691,11 @@ mod tests {
 
     #[test]
     fn review_required_transition_triggers_notification() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -639,7 +728,11 @@ mod tests {
 
     #[test]
     fn already_review_required_no_notification() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -671,7 +764,11 @@ mod tests {
 
     #[test]
     fn dismissed_pr_does_not_reappear_after_next_poll() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id_open = make_id(1);
         let id_closed = make_id(2);
 
@@ -726,7 +823,11 @@ mod tests {
 
     #[test]
     fn dismissed_pr_reappear_does_not_trigger_review_notification() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
 
         // Initial poll: open reviewer PR
@@ -770,7 +871,11 @@ mod tests {
     fn closed_pr_not_tracked_in_session_does_not_appear_on_subsequent_poll() {
         // Regression: closed/merged PRs that were already closed before the session started
         // must not appear in the list, even when they arrive in a subsequent poll payload.
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id_open = make_id(1);
         let id_closing = make_id(2);
         let id_already_closed = make_id(3);
@@ -817,7 +922,11 @@ mod tests {
 
     #[test]
     fn new_prs_detected() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         app.update(Message::PollResult(make_payload(2)));
         // Initial load: no markers (all PRs are "known" from the start)
         assert_eq!(app.new_pr_ids.len(), 0);
@@ -844,7 +953,11 @@ mod tests {
 
     #[test]
     fn comment_increase_on_author_pr_triggers_notification() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -867,7 +980,11 @@ mod tests {
 
     #[test]
     fn comment_increase_on_reviewer_pr_no_notification() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -889,7 +1006,11 @@ mod tests {
 
     #[test]
     fn comment_unchanged_no_notification() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -911,7 +1032,11 @@ mod tests {
 
     #[test]
     fn comment_increase_sets_new_comment_pr_ids() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -932,7 +1057,11 @@ mod tests {
 
     #[test]
     fn navigate_to_pr_clears_new_comment_pr_id() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -956,7 +1085,11 @@ mod tests {
 
     #[test]
     fn comment_increase_without_updated_at_triggers_notification() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
         let mut prs = IndexMap::new();
         // updated_at は固定 (0秒)、コメント数 0
@@ -980,7 +1113,11 @@ mod tests {
 
     #[test]
     fn comment_increase_on_both_role_pr_triggers_notification() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1002,7 +1139,11 @@ mod tests {
 
     #[test]
     fn open_selected_clears_new_comment_pr_id() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1027,7 +1168,11 @@ mod tests {
 
     #[test]
     fn new_comment_pr_ids_pruned_when_pr_removed_from_list() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1053,7 +1198,11 @@ mod tests {
 
     #[test]
     fn self_comment_does_not_trigger_notification() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
 
         // First poll: baseline
@@ -1079,7 +1228,11 @@ mod tests {
 
     #[test]
     fn other_comment_triggers_notification() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
 
         // First poll: baseline
@@ -1103,7 +1256,11 @@ mod tests {
 
     #[test]
     fn last_commenter_none_triggers_notification() {
-        let mut app = App::new("testuser".to_string(), ColorScheme::default());
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
         let id = make_id(1);
 
         // First poll: baseline
@@ -1128,5 +1285,391 @@ mod tests {
             "None last_commenter should still notify (safe fallback)"
         );
         assert_eq!(app.pending_notifications[0].title, "New comment");
+    }
+
+    // --- Notify event filter ---
+
+    fn events_except(event: NotifyEvent) -> HashSet<NotifyEvent> {
+        let mut all = NotifyEvent::all();
+        all.remove(&event);
+        all
+    }
+
+    #[test]
+    fn disabled_review_requested_suppresses_notification() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            events_except(NotifyEvent::ReviewRequested),
+        );
+        app.update(Message::PollResult(payload_from(IndexMap::new())));
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_custom(&id, PrRole::ReviewRequested, None, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+        assert!(app.pending_notifications.is_empty());
+    }
+
+    #[test]
+    fn disabled_pr_closed_suppresses_notification() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            events_except(NotifyEvent::PrClosed),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(id.clone(), make_pr_custom(&id, PrRole::Author, None, 0));
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(id.clone(), make_closed_pr(&id, PrRole::Author, 100));
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(app.pending_notifications.is_empty());
+    }
+
+    #[test]
+    fn disabled_pr_merged_suppresses_notification() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            events_except(NotifyEvent::PrMerged),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(id.clone(), make_pr_custom(&id, PrRole::Author, None, 0));
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(id.clone(), make_merged_pr(&id, PrRole::Author, 100));
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(app.pending_notifications.is_empty());
+    }
+
+    #[test]
+    fn disabled_pr_merged_still_allows_pr_closed() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            events_except(NotifyEvent::PrMerged),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(id.clone(), make_pr_custom(&id, PrRole::Author, None, 0));
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(id.clone(), make_closed_pr(&id, PrRole::Author, 100));
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert_eq!(app.pending_notifications.len(), 1);
+        assert_eq!(app.pending_notifications[0].title, "PR closed");
+    }
+
+    #[test]
+    fn disabled_re_review_requested_suppresses_notification() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            events_except(NotifyEvent::ReReviewRequested),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_custom(
+                &id,
+                PrRole::ReviewRequested,
+                Some(ReviewDecision::Approved),
+                0,
+            ),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_custom(
+                &id,
+                PrRole::ReviewRequested,
+                Some(ReviewDecision::ReviewRequired),
+                100,
+            ),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(app.pending_notifications.is_empty());
+    }
+
+    #[test]
+    fn disabled_new_comment_suppresses_notification_but_keeps_highlight() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            events_except(NotifyEvent::NewComment),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Author, None, 0, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_comments(&id, PrRole::Author, None, 100, 3),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(
+            app.pending_notifications.is_empty(),
+            "notification should be suppressed"
+        );
+        assert!(
+            app.new_comment_pr_ids.contains(&id),
+            "UI highlight should still be set"
+        );
+    }
+
+    #[test]
+    fn empty_events_suppresses_all_notifications() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            HashSet::new(),
+        );
+        // review requested
+        app.update(Message::PollResult(payload_from(IndexMap::new())));
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_custom(&id, PrRole::ReviewRequested, None, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+        assert!(app.pending_notifications.is_empty());
+    }
+
+    // --- CI finished notification ---
+
+    fn make_pr_with_ci(
+        id: &PrId,
+        role: PrRole,
+        updated_secs: i64,
+        ci_status: Option<CiStatus>,
+    ) -> PullRequest {
+        PullRequest {
+            ci_status,
+            ..make_pr_with_comments(id, role, None, updated_secs, 0)
+        }
+    }
+
+    #[test]
+    fn ci_pending_to_success_triggers_notification() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 0, Some(CiStatus::Pending)),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 100, Some(CiStatus::Success)),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert_eq!(app.pending_notifications.len(), 1);
+        assert_eq!(app.pending_notifications[0].title, "CI passed");
+    }
+
+    #[test]
+    fn ci_pending_to_failure_triggers_notification() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 0, Some(CiStatus::Pending)),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 100, Some(CiStatus::Failure)),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert_eq!(app.pending_notifications.len(), 1);
+        assert_eq!(app.pending_notifications[0].title, "CI failed");
+    }
+
+    #[test]
+    fn ci_success_to_success_no_notification() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 0, Some(CiStatus::Success)),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 100, Some(CiStatus::Success)),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(app.pending_notifications.is_empty());
+    }
+
+    #[test]
+    fn ci_none_to_success_no_notification() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(id.clone(), make_pr_with_ci(&id, PrRole::Author, 0, None));
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 100, Some(CiStatus::Success)),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(
+            app.pending_notifications.is_empty(),
+            "no notification when old ci_status is None"
+        );
+    }
+
+    #[test]
+    fn ci_notification_only_for_author() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::ReviewRequested, 0, Some(CiStatus::Pending)),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::ReviewRequested, 100, Some(CiStatus::Success)),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(
+            app.pending_notifications.is_empty(),
+            "reviewer should not get CI notification"
+        );
+    }
+
+    #[test]
+    fn ci_notification_for_both_role() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Both, 0, Some(CiStatus::Pending)),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Both, 100, Some(CiStatus::Failure)),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert_eq!(app.pending_notifications.len(), 1);
+        assert_eq!(app.pending_notifications[0].title, "CI failed");
+    }
+
+    #[test]
+    fn disabled_ci_finished_suppresses_notification() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            events_except(NotifyEvent::CiFinished),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 0, Some(CiStatus::Pending)),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        let mut prs2 = IndexMap::new();
+        prs2.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 100, Some(CiStatus::Success)),
+        );
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert!(app.pending_notifications.is_empty());
+    }
+
+    #[test]
+    fn ci_no_notification_on_first_poll() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 0, Some(CiStatus::Success)),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+
+        assert!(
+            app.pending_notifications.is_empty(),
+            "no CI notification on initial load"
+        );
     }
 }

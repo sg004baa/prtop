@@ -24,6 +24,7 @@ fn make_pr(owner: &str, repo: &str, number: u64, updated_secs: i64) -> (PrId, Pu
         review_decision: None,
         total_comments: 0,
         last_commenter: None,
+        ci_status: None,
     };
     (id, pr)
 }

@@ -62,6 +62,8 @@ pub struct PrNode {
     pub created_at: String,
     pub updated_at: String,
     pub review_decision: Option<String>,
+    #[serde(default)]
+    pub head_ref_oid: String,
     pub author: Option<ActorNode>,
     pub repository: RepoNode,
     pub comments: CommentsConnection,
@@ -83,4 +85,28 @@ pub struct RepoNode {
 #[derive(Debug, Deserialize)]
 pub struct RepoOwnerNode {
     pub login: String,
+}
+
+// --- REST API types for CI status fetch ---
+
+#[derive(Debug, Deserialize)]
+pub struct CombinedStatusResponse {
+    pub state: String,
+    #[serde(default)]
+    pub statuses: Vec<serde::de::IgnoredAny>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CheckRunsResponse {
+    #[serde(default)]
+    pub total_count: u64,
+    #[serde(default)]
+    pub check_runs: Vec<CheckRun>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CheckRun {
+    pub status: String,
+    pub conclusion: Option<String>,
 }
