@@ -17,9 +17,18 @@ A terminal-resident TUI that monitors GitHub pull requests you're involved in as
 Tested on Linux(Ubuntu). macOS and Windows are untested.
 
 ## Installation
+### Homebrew
+```bash
+brew install sg004baa/tap/prtop
+```
 
+### Cargo
 ```bash
 cargo install prtop
+```
+
+## Usage
+```bash
 prt
 ```
 
