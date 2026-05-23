@@ -40,6 +40,3 @@ proptest = "1"
 [profile.dist]
 inherits = "release"
 lto = "thin"
-
-[dist]
-allow-dirty = ["ci"]
