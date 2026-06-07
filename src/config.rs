@@ -48,7 +48,7 @@ impl NotifyEvent {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "prtop", about = "GitHub PR Live Viewer")]
+#[command(name = "prt", version, about = "GitHub PR Live Viewer")]
 struct Cli {
     #[arg(long, env = "PRTOP_GITHUB_TOKEN")]
     github_token: Option<String>,
