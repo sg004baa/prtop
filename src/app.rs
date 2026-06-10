@@ -148,8 +148,11 @@ impl App {
                 if let Some(i) = self.list_state.selected()
                     && let Some((id, pr)) = self.prs.get_index(i)
                 {
-                    self.new_pr_ids.remove(id);
-                    self.new_comment_pr_ids.remove(id);
+                    let removed_new = self.new_pr_ids.remove(id);
+                    let removed_comment = self.new_comment_pr_ids.remove(id);
+                    if removed_new || removed_comment {
+                        self.dirty = true;
+                    }
                     let url = pr.url.clone();
                     if open::that(&url).is_err() {
                         self.status_message = Some(format!("Failed to open browser: {url}"));
@@ -303,7 +306,13 @@ impl App {
                 // Prune new_comment_pr_ids for PRs no longer in the list
                 self.new_comment_pr_ids
                     .retain(|id| incoming.contains_key(id));
+                // 選択は行番号ではなく PR に追従させる。ポーリングで順序が変わったり
+                // 件数が減ったりしても、ハイライトが別の PR に飛ばないように ID で再解決する。
+                let selected = self.selected_id();
                 self.prs = incoming;
+                if let Some(id) = selected {
+                    self.list_state.select(self.prs.get_index_of(&id));
+                }
                 self.last_poll = Some(payload.polled_at);
                 self.poll_error = None;
                 self.status_message = None;
@@ -315,6 +324,9 @@ impl App {
             }
             Message::PollError(msg) => {
                 self.poll_error = Some(msg.clone());
+                // フッターは status_message を優先表示するため、"Refreshing..." が
+                // 残っているとエラーが見えないままになる。
+                self.status_message = None;
                 if matches!(self.loading, LoadingState::Initial | LoadingState::Loading) {
                     self.loading = LoadingState::Error(msg);
                 }
@@ -527,6 +539,24 @@ mod tests {
         app.update(Message::PollError("network error".to_string()));
         assert!(app.poll_error.is_some());
         assert!(matches!(app.loading, LoadingState::Error(_)));
+    }
+
+    #[test]
+    fn poll_error_clears_stale_status_message() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        app.update(Message::PollResult(make_payload(1)));
+        app.update(Message::Refresh);
+        assert!(app.status_message.is_some());
+
+        // The footer prefers status_message over poll_error, so a failed refresh
+        // must clear "Refreshing..." or the error stays invisible forever.
+        app.update(Message::PollError("network error".to_string()));
+        assert_eq!(app.status_message, None);
+        assert!(app.poll_error.is_some());
     }
 
     // --- Notification logic ---
@@ -1014,6 +1044,71 @@ mod tests {
     }
 
     #[test]
+    fn selection_follows_pr_identity_across_poll_reorder() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id_a = make_id(1);
+        let id_b = make_id(2);
+
+        let mut prs = IndexMap::new();
+        prs.insert(id_a.clone(), make_pr_custom(&id_a, PrRole::Author, None, 0));
+        prs.insert(id_b.clone(), make_pr_custom(&id_b, PrRole::Author, None, 0));
+        app.update(Message::PollResult(payload_from(prs)));
+
+        // Select id_b (index 1)
+        app.update(Message::MoveDown);
+        app.update(Message::MoveDown);
+        assert_eq!(app.selected_pr().unwrap().id, id_b);
+
+        // Next poll: order reversed (id_b first)
+        let mut prs2 = IndexMap::new();
+        prs2.insert(id_b.clone(), make_pr_custom(&id_b, PrRole::Author, None, 0));
+        prs2.insert(id_a.clone(), make_pr_custom(&id_a, PrRole::Author, None, 0));
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert_eq!(
+            app.selected_pr().unwrap().id,
+            id_b,
+            "selection must follow the PR, not the row index"
+        );
+        assert_eq!(app.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn selection_cleared_when_selected_pr_disappears() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id_a = make_id(1);
+        let id_b = make_id(2);
+
+        let mut prs = IndexMap::new();
+        prs.insert(id_a.clone(), make_pr_custom(&id_a, PrRole::Author, None, 0));
+        prs.insert(id_b.clone(), make_pr_custom(&id_b, PrRole::Author, None, 0));
+        app.update(Message::PollResult(payload_from(prs)));
+
+        // Select id_b (index 1)
+        app.update(Message::MoveDown);
+        app.update(Message::MoveDown);
+
+        // Next poll: id_b is gone
+        let mut prs2 = IndexMap::new();
+        prs2.insert(id_a.clone(), make_pr_custom(&id_a, PrRole::Author, None, 0));
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert_eq!(
+            app.list_state.selected(),
+            None,
+            "stale index must not point at a different PR"
+        );
+    }
+
+    #[test]
     fn new_prs_detected() {
         let mut app = App::new(
             "testuser".to_string(),
@@ -1254,9 +1349,14 @@ mod tests {
         app.update(Message::MoveDown); // select the PR
         // re-add flag manually to simulate state
         app.new_comment_pr_ids.insert(id.clone());
+        app.dirty = false;
 
         app.update(Message::OpenSelected);
         assert!(!app.new_comment_pr_ids.contains(&id));
+        assert!(
+            app.dirty,
+            "clearing the highlight marker must trigger a redraw"
+        );
     }
 
     #[test]

@@ -4,6 +4,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, HighlightSpacing, List, ListItem, Paragraph};
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use crate::app::{App, LoadingState, Screen};
 use crate::types::{CiStatus, PrRole, PrState};
 
@@ -35,7 +37,7 @@ fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize, usize,
     let max_title = app
         .prs
         .values()
-        .map(|pr| pr.title.chars().count())
+        .map(|pr| pr.title.width())
         .max()
         .unwrap_or(20);
 
@@ -215,17 +217,10 @@ fn render_list(
                     format!("{:<width$}", number_display, width = num_w),
                     Style::default().fg(app.colors.number),
                 ),
-                Span::styled(
-                    format!("{:<width$}", truncate(&pr.title, title_w), width = title_w),
-                    title_style,
-                ),
+                Span::styled(pad(&truncate(&pr.title, title_w), title_w), title_style),
                 Span::raw("  "),
                 Span::styled(
-                    format!(
-                        "{:<width$}",
-                        truncate(&repo_display, repo_w),
-                        width = repo_w
-                    ),
+                    pad(&truncate(&repo_display, repo_w), repo_w),
                     Style::default().fg(app.colors.repo),
                 ),
             ]);
@@ -303,14 +298,79 @@ fn ci_cell(ci: Option<&CiStatus>) -> (&'static str, Style) {
     }
 }
 
+/// `format!("{:<w$}")` は文字数でパディングするため、全角文字（表示幅2）が
+/// 混ざると列がずれる。表示幅ベースでパディング・切り詰めする。
+fn pad(s: &str, width: usize) -> String {
+    let mut out = s.to_string();
+    out.extend(std::iter::repeat_n(' ', width.saturating_sub(s.width())));
+    out
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max - 1).collect();
-        format!("{truncated}…")
+    if s.width() <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > max - 1 {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_ascii_within_limit_unchanged() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_ascii_over_limit_adds_ellipsis() {
+        assert_eq!(truncate("hello world", 6), "hello…");
+    }
+
+    #[test]
+    fn truncate_zero_returns_empty() {
+        assert_eq!(truncate("hello", 0), "");
+    }
+
+    #[test]
+    fn truncate_wide_chars_respects_display_width() {
+        // "日本語" = width 6, fits exactly
+        assert_eq!(truncate("日本語", 6), "日本語");
+        // width 14 → cut to ≤ max, ellipsis included
+        let cut = truncate("日本語タイトル", 8);
+        assert_eq!(cut, "日本語…");
+        assert!(cut.width() <= 8);
+    }
+
+    #[test]
+    fn truncate_never_exceeds_max_width() {
+        for max in 1..10 {
+            let cut = truncate("あiうeお", max);
+            assert!(cut.width() <= max, "max={max} got width {}", cut.width());
+        }
+    }
+
+    #[test]
+    fn pad_uses_display_width() {
+        // "日本語" は 3 文字だが表示幅 6 → パディングは 4 で計 10
+        assert_eq!(pad("日本語", 10), "日本語    ");
+        assert_eq!(pad("abc", 5), "abc  ");
+        // already wider: no truncation, no panic
+        assert_eq!(pad("abcdef", 3), "abcdef");
     }
 }

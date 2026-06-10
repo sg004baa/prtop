@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use app::{App, Message};
+use app::{App, Message, Screen};
 use config::Config;
 use github::client::GitHubClient;
 use notify::build_notifier;
@@ -102,7 +102,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
             Some(msg) = msg_rx.recv() => {
-                let is_refresh = matches!(msg, Message::Refresh);
+                // Help 画面中の 'r' は「ヘルプを閉じる」操作として消費されるため、
+                // ポーラーへの refresh 転送も抑止する。
+                let is_refresh =
+                    matches!(msg, Message::Refresh) && app.screen != Screen::Help;
                 app.update(msg);
                 if is_refresh {
                     let _ = refresh_tx.send(()).await;
