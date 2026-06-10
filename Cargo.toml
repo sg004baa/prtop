@@ -30,6 +30,7 @@ thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
 open = "5"
 dirs = "6"
+unicode-width = "0.2"
 
 [dev-dependencies]
 wiremock = "0.6"
