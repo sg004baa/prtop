@@ -303,7 +303,13 @@ impl App {
                 // Prune new_comment_pr_ids for PRs no longer in the list
                 self.new_comment_pr_ids
                     .retain(|id| incoming.contains_key(id));
+                // 選択は行番号ではなく PR に追従させる。ポーリングで順序が変わったり
+                // 件数が減ったりしても、ハイライトが別の PR に飛ばないように ID で再解決する。
+                let selected = self.selected_id();
                 self.prs = incoming;
+                if let Some(id) = selected {
+                    self.list_state.select(self.prs.get_index_of(&id));
+                }
                 self.last_poll = Some(payload.polled_at);
                 self.poll_error = None;
                 self.status_message = None;
@@ -1011,6 +1017,71 @@ mod tests {
             "PR that transitioned during session must appear"
         );
         assert_eq!(app.prs.len(), 2); // id_open + id_closing
+    }
+
+    #[test]
+    fn selection_follows_pr_identity_across_poll_reorder() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id_a = make_id(1);
+        let id_b = make_id(2);
+
+        let mut prs = IndexMap::new();
+        prs.insert(id_a.clone(), make_pr_custom(&id_a, PrRole::Author, None, 0));
+        prs.insert(id_b.clone(), make_pr_custom(&id_b, PrRole::Author, None, 0));
+        app.update(Message::PollResult(payload_from(prs)));
+
+        // Select id_b (index 1)
+        app.update(Message::MoveDown);
+        app.update(Message::MoveDown);
+        assert_eq!(app.selected_pr().unwrap().id, id_b);
+
+        // Next poll: order reversed (id_b first)
+        let mut prs2 = IndexMap::new();
+        prs2.insert(id_b.clone(), make_pr_custom(&id_b, PrRole::Author, None, 0));
+        prs2.insert(id_a.clone(), make_pr_custom(&id_a, PrRole::Author, None, 0));
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert_eq!(
+            app.selected_pr().unwrap().id,
+            id_b,
+            "selection must follow the PR, not the row index"
+        );
+        assert_eq!(app.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn selection_cleared_when_selected_pr_disappears() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id_a = make_id(1);
+        let id_b = make_id(2);
+
+        let mut prs = IndexMap::new();
+        prs.insert(id_a.clone(), make_pr_custom(&id_a, PrRole::Author, None, 0));
+        prs.insert(id_b.clone(), make_pr_custom(&id_b, PrRole::Author, None, 0));
+        app.update(Message::PollResult(payload_from(prs)));
+
+        // Select id_b (index 1)
+        app.update(Message::MoveDown);
+        app.update(Message::MoveDown);
+
+        // Next poll: id_b is gone
+        let mut prs2 = IndexMap::new();
+        prs2.insert(id_a.clone(), make_pr_custom(&id_a, PrRole::Author, None, 0));
+        app.update(Message::PollResult(payload_from(prs2)));
+
+        assert_eq!(
+            app.list_state.selected(),
+            None,
+            "stale index must not point at a different PR"
+        );
     }
 
     #[test]
