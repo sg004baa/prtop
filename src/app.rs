@@ -148,8 +148,11 @@ impl App {
                 if let Some(i) = self.list_state.selected()
                     && let Some((id, pr)) = self.prs.get_index(i)
                 {
-                    self.new_pr_ids.remove(id);
-                    self.new_comment_pr_ids.remove(id);
+                    let removed_new = self.new_pr_ids.remove(id);
+                    let removed_comment = self.new_comment_pr_ids.remove(id);
+                    if removed_new || removed_comment {
+                        self.dirty = true;
+                    }
                     let url = pr.url.clone();
                     if open::that(&url).is_err() {
                         self.status_message = Some(format!("Failed to open browser: {url}"));
@@ -321,6 +324,9 @@ impl App {
             }
             Message::PollError(msg) => {
                 self.poll_error = Some(msg.clone());
+                // フッターは status_message を優先表示するため、"Refreshing..." が
+                // 残っているとエラーが見えないままになる。
+                self.status_message = None;
                 if matches!(self.loading, LoadingState::Initial | LoadingState::Loading) {
                     self.loading = LoadingState::Error(msg);
                 }
@@ -533,6 +539,24 @@ mod tests {
         app.update(Message::PollError("network error".to_string()));
         assert!(app.poll_error.is_some());
         assert!(matches!(app.loading, LoadingState::Error(_)));
+    }
+
+    #[test]
+    fn poll_error_clears_stale_status_message() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        app.update(Message::PollResult(make_payload(1)));
+        app.update(Message::Refresh);
+        assert!(app.status_message.is_some());
+
+        // The footer prefers status_message over poll_error, so a failed refresh
+        // must clear "Refreshing..." or the error stays invisible forever.
+        app.update(Message::PollError("network error".to_string()));
+        assert_eq!(app.status_message, None);
+        assert!(app.poll_error.is_some());
     }
 
     // --- Notification logic ---
@@ -1325,9 +1349,14 @@ mod tests {
         app.update(Message::MoveDown); // select the PR
         // re-add flag manually to simulate state
         app.new_comment_pr_ids.insert(id.clone());
+        app.dirty = false;
 
         app.update(Message::OpenSelected);
         assert!(!app.new_comment_pr_ids.contains(&id));
+        assert!(
+            app.dirty,
+            "clearing the highlight marker must trigger a redraw"
+        );
     }
 
     #[test]
