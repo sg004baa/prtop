@@ -217,10 +217,11 @@ fn compute_ci_status(
         return None;
     }
 
-    // Pending if any check run is not completed.
+    // Pending if any check run is not completed, or is waiting for user action
+    // (`action_required` completes the run but CI has not actually finished).
     if let Some(cr) = check_runs {
         for run in &cr.check_runs {
-            if run.status != "completed" {
+            if run.status != "completed" || run.conclusion.as_deref() == Some("action_required") {
                 return Some(CiStatus::Pending);
             }
         }
@@ -234,12 +235,12 @@ fn compute_ci_status(
         return Some(CiStatus::Pending);
     }
 
-    // Failure if any check run failed (failure / cancelled / timed_out).
+    // Failure if any check run failed (failure / cancelled / timed_out / startup_failure).
     if let Some(cr) = check_runs {
         for run in &cr.check_runs {
             if matches!(
                 run.conclusion.as_deref(),
-                Some("failure" | "cancelled" | "timed_out")
+                Some("failure" | "cancelled" | "timed_out" | "startup_failure")
             ) {
                 return Some(CiStatus::Failure);
             }
@@ -529,6 +530,60 @@ mod tests {
         let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
         let result = client.fetch_ci_status("o", "r", "abc").await.unwrap();
         assert_eq!(result, Some(CiStatus::Failure));
+    }
+
+    #[tokio::test]
+    async fn ci_status_startup_failure_returns_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/commits/abc/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "state": "success",
+                "statuses": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/commits/abc/check-runs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total_count": 1,
+                "check_runs": [
+                    {"status": "completed", "conclusion": "startup_failure"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
+        let result = client.fetch_ci_status("o", "r", "abc").await.unwrap();
+        assert_eq!(result, Some(CiStatus::Failure));
+    }
+
+    #[tokio::test]
+    async fn ci_status_action_required_returns_pending() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/commits/abc/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "state": "success",
+                "statuses": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/commits/abc/check-runs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total_count": 1,
+                "check_runs": [
+                    {"status": "completed", "conclusion": "action_required"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
+        let result = client.fetch_ci_status("o", "r", "abc").await.unwrap();
+        assert_eq!(result, Some(CiStatus::Pending));
     }
 
     #[tokio::test]
