@@ -21,7 +21,7 @@ impl GitHubClient {
     pub fn new(token: String) -> Self {
         Self {
             client: Client::builder()
-                .user_agent("prtop/0.1.0")
+                .user_agent(concat!("prtop/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("failed to build HTTP client"),
             token,
@@ -33,7 +33,7 @@ impl GitHubClient {
     pub fn new_with_base_url(token: String, api_base: String) -> Self {
         Self {
             client: Client::builder()
-                .user_agent("prtop/0.1.0")
+                .user_agent(concat!("prtop/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("failed to build HTTP client"),
             token,
