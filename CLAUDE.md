@@ -70,7 +70,7 @@ Notification triggers (only after initial load, checked in `Message::PollResult`
 
 ### Config Priority
 
-CLI args > env vars (`GITHUB_TOKEN`, `GITHUB_USERNAME`) > `~/.config/prtop/config.toml`
+CLI args > env vars (`PRTOP_GITHUB_TOKEN`, `PRTOP_GITHUB_USERNAME`) > `~/.config/prtop/config.toml`
 
 Config keys: `github_token`, `username`, `poll_interval_secs`, `[notify].enabled`, plus per-event toggles under `[notify]`.
 
