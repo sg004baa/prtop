@@ -1,4 +1,4 @@
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +32,11 @@ pub async fn event_loop(tx: mpsc::Sender<Message>, cancel: CancellationToken) {
 }
 
 fn key_to_message(key: KeyEvent) -> Option<Message> {
+    // Windows と kitty キーボードプロトコルでは Release イベントも届くため、
+    // 無視しないと 1 キー押下で 2 回入力が走る。
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
     match key.code {
         KeyCode::Char('q') => Some(Message::Quit),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Message::Quit),
@@ -41,5 +46,43 @@ fn key_to_message(key: KeyEvent) -> Option<Message> {
         KeyCode::Char('?') => Some(Message::ToggleHelp),
         KeyCode::Char('r') => Some(Message::Refresh),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
+        let mut ev = KeyEvent::new(code, KeyModifiers::NONE);
+        ev.kind = kind;
+        ev
+    }
+
+    #[test]
+    fn press_maps_to_message() {
+        assert!(matches!(
+            key_to_message(key(KeyCode::Char('q'), KeyEventKind::Press)),
+            Some(Message::Quit)
+        ));
+        assert!(matches!(
+            key_to_message(key(KeyCode::Char('j'), KeyEventKind::Press)),
+            Some(Message::MoveDown)
+        ));
+    }
+
+    #[test]
+    fn repeat_maps_to_message() {
+        assert!(matches!(
+            key_to_message(key(KeyCode::Char('j'), KeyEventKind::Repeat)),
+            Some(Message::MoveDown)
+        ));
+    }
+
+    #[test]
+    fn release_is_ignored() {
+        assert!(key_to_message(key(KeyCode::Char('q'), KeyEventKind::Release)).is_none());
+        assert!(key_to_message(key(KeyCode::Char('j'), KeyEventKind::Release)).is_none());
+        assert!(key_to_message(key(KeyCode::Enter, KeyEventKind::Release)).is_none());
     }
 }
