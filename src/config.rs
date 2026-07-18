@@ -11,6 +11,7 @@ use crate::error::AppError;
 #[serde(rename_all = "snake_case")]
 pub enum NotifyEvent {
     ReviewRequested,
+    Mentioned,
     PrClosed,
     PrMerged,
     ReReviewRequested,
@@ -24,6 +25,7 @@ impl NotifyEvent {
     pub fn all() -> HashSet<NotifyEvent> {
         HashSet::from([
             NotifyEvent::ReviewRequested,
+            NotifyEvent::Mentioned,
             NotifyEvent::PrClosed,
             NotifyEvent::PrMerged,
             NotifyEvent::ReReviewRequested,
@@ -39,6 +41,7 @@ impl NotifyEvent {
     pub fn defaults() -> HashSet<NotifyEvent> {
         HashSet::from([
             NotifyEvent::ReviewRequested,
+            NotifyEvent::Mentioned,
             NotifyEvent::PrClosed,
             NotifyEvent::PrMerged,
             NotifyEvent::ReReviewRequested,
@@ -64,6 +67,7 @@ struct Cli {
 struct NotifyFileConfig {
     enabled: Option<bool>,
     review_requested: Option<bool>,
+    mentioned: Option<bool>,
     pr_closed: Option<bool>,
     pr_merged: Option<bool>,
     re_review_requested: Option<bool>,
@@ -112,6 +116,9 @@ fn resolve_notify_events(notify: &NotifyFileConfig) -> HashSet<NotifyEvent> {
     if notify.review_requested.unwrap_or(true) {
         events.insert(NotifyEvent::ReviewRequested);
     }
+    if notify.mentioned.unwrap_or(true) {
+        events.insert(NotifyEvent::Mentioned);
+    }
     if notify.pr_closed.unwrap_or(true) {
         events.insert(NotifyEvent::PrClosed);
     }
@@ -132,155 +139,6 @@ fn resolve_notify_events(notify: &NotifyFileConfig) -> HashSet<NotifyEvent> {
 
 fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("prtop").join("config.toml"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn poll_interval_file_wins_when_cli_not_specified() {
-        assert_eq!(resolve_poll_interval(None, Some(30)), 30);
-    }
-
-    #[test]
-    fn poll_interval_cli_wins_over_file() {
-        assert_eq!(resolve_poll_interval(Some(120), Some(30)), 120);
-    }
-
-    #[test]
-    fn poll_interval_defaults_to_60() {
-        assert_eq!(resolve_poll_interval(None, None), 60);
-    }
-
-    // --- NotifyEvent ---
-
-    #[test]
-    fn notify_event_all_contains_every_variant() {
-        let all = NotifyEvent::all();
-        assert_eq!(all.len(), 6);
-        assert!(all.contains(&NotifyEvent::ReviewRequested));
-        assert!(all.contains(&NotifyEvent::PrClosed));
-        assert!(all.contains(&NotifyEvent::PrMerged));
-        assert!(all.contains(&NotifyEvent::ReReviewRequested));
-        assert!(all.contains(&NotifyEvent::NewComment));
-        assert!(all.contains(&NotifyEvent::CiFinished));
-    }
-
-    #[test]
-    fn notify_event_deserialize_snake_case() {
-        let cases = [
-            ("\"review_requested\"", NotifyEvent::ReviewRequested),
-            ("\"pr_closed\"", NotifyEvent::PrClosed),
-            ("\"pr_merged\"", NotifyEvent::PrMerged),
-            ("\"re_review_requested\"", NotifyEvent::ReReviewRequested),
-            ("\"new_comment\"", NotifyEvent::NewComment),
-            ("\"ci_finished\"", NotifyEvent::CiFinished),
-        ];
-        for (json, expected) in cases {
-            let parsed: NotifyEvent = serde_json::from_str(json).unwrap();
-            assert_eq!(parsed, expected);
-        }
-    }
-
-    #[test]
-    fn notify_event_deserialize_unknown_fails() {
-        let result: Result<NotifyEvent, _> = serde_json::from_str("\"unknown_event\"");
-        assert!(result.is_err());
-    }
-
-    // --- resolve_notify_events ---
-
-    #[test]
-    fn resolve_all_none_returns_defaults() {
-        let events = resolve_notify_events(&NotifyFileConfig::default());
-        assert_eq!(events, NotifyEvent::defaults());
-        assert!(!events.contains(&NotifyEvent::CiFinished));
-    }
-
-    #[test]
-    fn defaults_excludes_ci_finished() {
-        let defaults = NotifyEvent::defaults();
-        assert_eq!(defaults.len(), 5);
-        assert!(defaults.contains(&NotifyEvent::ReviewRequested));
-        assert!(defaults.contains(&NotifyEvent::PrClosed));
-        assert!(defaults.contains(&NotifyEvent::PrMerged));
-        assert!(defaults.contains(&NotifyEvent::ReReviewRequested));
-        assert!(defaults.contains(&NotifyEvent::NewComment));
-        assert!(!defaults.contains(&NotifyEvent::CiFinished));
-    }
-
-    #[test]
-    fn ci_finished_true_enables_it() {
-        let cfg = NotifyFileConfig {
-            ci_finished: Some(true),
-            ..Default::default()
-        };
-        let events = resolve_notify_events(&cfg);
-        assert!(events.contains(&NotifyEvent::CiFinished));
-        // Other defaults still on.
-        assert!(events.contains(&NotifyEvent::ReviewRequested));
-    }
-
-    #[test]
-    fn individual_false_disables_specific_event() {
-        let cfg = NotifyFileConfig {
-            new_comment: Some(false),
-            pr_merged: Some(false),
-            ..Default::default()
-        };
-        let events = resolve_notify_events(&cfg);
-        assert!(!events.contains(&NotifyEvent::NewComment));
-        assert!(!events.contains(&NotifyEvent::PrMerged));
-        assert!(events.contains(&NotifyEvent::ReviewRequested));
-        assert!(events.contains(&NotifyEvent::PrClosed));
-        assert!(events.contains(&NotifyEvent::ReReviewRequested));
-    }
-
-    #[test]
-    fn all_false_returns_empty() {
-        let cfg = NotifyFileConfig {
-            review_requested: Some(false),
-            pr_closed: Some(false),
-            pr_merged: Some(false),
-            re_review_requested: Some(false),
-            new_comment: Some(false),
-            ci_finished: Some(false),
-            ..Default::default()
-        };
-        assert!(resolve_notify_events(&cfg).is_empty());
-    }
-
-    // --- TOML deserialization ---
-
-    #[test]
-    fn toml_notify_with_individual_toggles() {
-        let toml_str = r#"
-            enabled = true
-            new_comment = false
-            ci_finished = true
-        "#;
-        let parsed: NotifyFileConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(parsed.enabled, Some(true));
-        assert_eq!(parsed.new_comment, Some(false));
-        assert_eq!(parsed.ci_finished, Some(true));
-        assert!(parsed.review_requested.is_none());
-
-        let events = resolve_notify_events(&parsed);
-        assert!(events.contains(&NotifyEvent::CiFinished));
-        assert!(!events.contains(&NotifyEvent::NewComment));
-        assert!(events.contains(&NotifyEvent::ReviewRequested));
-    }
-
-    #[test]
-    fn toml_notify_enabled_only_matches_defaults() {
-        let toml_str = r#"
-            enabled = true
-        "#;
-        let parsed: NotifyFileConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(parsed.enabled, Some(true));
-        assert_eq!(resolve_notify_events(&parsed), NotifyEvent::defaults());
-    }
 }
 
 fn load_file_config() -> FileConfig {
@@ -369,5 +227,158 @@ impl Config {
             notify_events,
             color_scheme,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_interval_file_wins_when_cli_not_specified() {
+        assert_eq!(resolve_poll_interval(None, Some(30)), 30);
+    }
+
+    #[test]
+    fn poll_interval_cli_wins_over_file() {
+        assert_eq!(resolve_poll_interval(Some(120), Some(30)), 120);
+    }
+
+    #[test]
+    fn poll_interval_defaults_to_60() {
+        assert_eq!(resolve_poll_interval(None, None), 60);
+    }
+
+    // --- NotifyEvent ---
+
+    #[test]
+    fn notify_event_all_contains_every_variant() {
+        let all = NotifyEvent::all();
+        assert_eq!(all.len(), 7);
+        assert!(all.contains(&NotifyEvent::ReviewRequested));
+        assert!(all.contains(&NotifyEvent::Mentioned));
+        assert!(all.contains(&NotifyEvent::PrClosed));
+        assert!(all.contains(&NotifyEvent::PrMerged));
+        assert!(all.contains(&NotifyEvent::ReReviewRequested));
+        assert!(all.contains(&NotifyEvent::NewComment));
+        assert!(all.contains(&NotifyEvent::CiFinished));
+    }
+
+    #[test]
+    fn notify_event_deserialize_snake_case() {
+        let cases = [
+            ("\"review_requested\"", NotifyEvent::ReviewRequested),
+            ("\"mentioned\"", NotifyEvent::Mentioned),
+            ("\"pr_closed\"", NotifyEvent::PrClosed),
+            ("\"pr_merged\"", NotifyEvent::PrMerged),
+            ("\"re_review_requested\"", NotifyEvent::ReReviewRequested),
+            ("\"new_comment\"", NotifyEvent::NewComment),
+            ("\"ci_finished\"", NotifyEvent::CiFinished),
+        ];
+        for (json, expected) in cases {
+            let parsed: NotifyEvent = serde_json::from_str(json).unwrap();
+            assert_eq!(parsed, expected);
+        }
+    }
+
+    #[test]
+    fn notify_event_deserialize_unknown_fails() {
+        let result: Result<NotifyEvent, _> = serde_json::from_str("\"unknown_event\"");
+        assert!(result.is_err());
+    }
+
+    // --- resolve_notify_events ---
+
+    #[test]
+    fn resolve_all_none_returns_defaults() {
+        let events = resolve_notify_events(&NotifyFileConfig::default());
+        assert_eq!(events, NotifyEvent::defaults());
+        assert!(!events.contains(&NotifyEvent::CiFinished));
+    }
+
+    #[test]
+    fn defaults_excludes_ci_finished() {
+        let defaults = NotifyEvent::defaults();
+        assert_eq!(defaults.len(), 6);
+        assert!(defaults.contains(&NotifyEvent::ReviewRequested));
+        assert!(defaults.contains(&NotifyEvent::Mentioned));
+        assert!(defaults.contains(&NotifyEvent::PrClosed));
+        assert!(defaults.contains(&NotifyEvent::PrMerged));
+        assert!(defaults.contains(&NotifyEvent::ReReviewRequested));
+        assert!(defaults.contains(&NotifyEvent::NewComment));
+        assert!(!defaults.contains(&NotifyEvent::CiFinished));
+    }
+
+    #[test]
+    fn ci_finished_true_enables_it() {
+        let cfg = NotifyFileConfig {
+            ci_finished: Some(true),
+            ..Default::default()
+        };
+        let events = resolve_notify_events(&cfg);
+        assert!(events.contains(&NotifyEvent::CiFinished));
+        // Other defaults still on.
+        assert!(events.contains(&NotifyEvent::ReviewRequested));
+    }
+
+    #[test]
+    fn individual_false_disables_specific_event() {
+        let cfg = NotifyFileConfig {
+            new_comment: Some(false),
+            pr_merged: Some(false),
+            ..Default::default()
+        };
+        let events = resolve_notify_events(&cfg);
+        assert!(!events.contains(&NotifyEvent::NewComment));
+        assert!(!events.contains(&NotifyEvent::PrMerged));
+        assert!(events.contains(&NotifyEvent::ReviewRequested));
+        assert!(events.contains(&NotifyEvent::PrClosed));
+        assert!(events.contains(&NotifyEvent::ReReviewRequested));
+    }
+
+    #[test]
+    fn all_false_returns_empty() {
+        let cfg = NotifyFileConfig {
+            review_requested: Some(false),
+            mentioned: Some(false),
+            pr_closed: Some(false),
+            pr_merged: Some(false),
+            re_review_requested: Some(false),
+            new_comment: Some(false),
+            ci_finished: Some(false),
+            ..Default::default()
+        };
+        assert!(resolve_notify_events(&cfg).is_empty());
+    }
+
+    // --- TOML deserialization ---
+
+    #[test]
+    fn toml_notify_with_individual_toggles() {
+        let toml_str = r#"
+            enabled = true
+            new_comment = false
+            ci_finished = true
+        "#;
+        let parsed: NotifyFileConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.enabled, Some(true));
+        assert_eq!(parsed.new_comment, Some(false));
+        assert_eq!(parsed.ci_finished, Some(true));
+        assert!(parsed.review_requested.is_none());
+
+        let events = resolve_notify_events(&parsed);
+        assert!(events.contains(&NotifyEvent::CiFinished));
+        assert!(!events.contains(&NotifyEvent::NewComment));
+        assert!(events.contains(&NotifyEvent::ReviewRequested));
+    }
+
+    #[test]
+    fn toml_notify_enabled_only_matches_defaults() {
+        let toml_str = r#"
+            enabled = true
+        "#;
+        let parsed: NotifyFileConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.enabled, Some(true));
+        assert_eq!(resolve_notify_events(&parsed), NotifyEvent::defaults());
     }
 }

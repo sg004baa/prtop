@@ -1,15 +1,16 @@
 # prtop
 
-A terminal-resident TUI that monitors GitHub pull requests you're involved in as author or reviewer, updating in real time via periodic polling.
+A terminal-resident TUI that monitors GitHub pull requests you're involved in as author, reviewer, or mentioned user, updating in real time via periodic polling.
 
 ![](<スクリーンショット 2026-03-21 144858.png>)
 
 ## Features
 
-- Lists PRs where you are the author or a requested reviewer, with status (Open/Closed/Merged)
+- Lists PRs where you are the author, a requested reviewer, or mentioned, with status (Open/Closed/Merged)
 - Auto-refreshes on a configurable interval
-- Terminal notifications on key events (merged, review requested, re-review requested)
+- Terminal notifications on key events (merged, review requested, re-review requested, mentioned)
 - Keyboard navigation with browser open on Enter
+- Mentioned PRs disappear once opened and come back only when you are mentioned again
 - Compact inline display — fits alongside other terminal panes
 
 ## Platform Support
@@ -67,6 +68,7 @@ To enable, add to `config.toml`:
 enabled = true
 # Per-event toggles (omit any line to use its default)
 # review_requested    = true
+# mentioned           = true
 # pr_closed           = true
 # pr_merged           = true
 # re_review_requested = true
@@ -78,12 +80,13 @@ enabled = true
 
 | Event                 | Default | Condition                                                       |
 | --------------------- | :-----: | --------------------------------------------------------------- |
-| `review_requested`    |    ✅    | A new PR appears where you are **not** the author               |
+| `review_requested`    |    ✅    | A new PR appears where review is requested from you             |
+| `mentioned`           |    ✅    | A new PR appears where you are mentioned                        |
 | `pr_closed`           |    ✅    | Your authored PR transitions to closed                          |
 | `pr_merged`           |    ✅    | Your authored PR is merged                                      |
 | `re_review_requested` |    ✅    | `review_decision` changes to `ReviewRequired`                   |
 | `new_comment`         |    ✅    | Comment count increases on your authored PR (self-comment skip) |
-| `ci_finished`         |    ❌    | CI transitions from in-progress to success/failure (author/both) |
+| `ci_finished`         |    ❌    | CI transitions from in-progress to success/failure (author only) |
 
 CI status is fetched every poll (per-PR REST calls to
 `/repos/{owner}/{repo}/commits/{sha}/status` and `/check-runs`) and shown in
@@ -96,6 +99,14 @@ shows `-` for every PR.
 transitions from in-progress to success/failure. It defaults off because CI
 flapping can be noisy.
 
+## Mentions
+
+PRs where you are mentioned (GitHub search `mentions:{username}`) show up with the
+`MENTION` role. Opening a mentioned PR in the browser dismisses it from the list;
+it reappears (with a notification) only when someone else mentions you again in an
+issue comment on that PR. Dismissals are persisted in
+`<cache_dir>/prtop/dismissed.json` (e.g. `~/.cache/prtop/dismissed.json`).
+
 ## Color Scheme
 
 All UI colors can be customized in `config.toml`:
@@ -104,7 +115,7 @@ All UI colors can be customized in `config.toml`:
 [colors]
 app_title    = "cyan"         # "GitHub PR Live" in header
 col_header   = "dark_gray"    # column header row
-role         = "cyan"         # AUTHOR / REVIEW / BOTH
+role         = "cyan"         # AUTHOR / REVIEW / MENTION
 number       = "yellow"       # #1234
 repo         = "blue"         # org/repo
 new_pr       = "green"        # newly appeared PRs

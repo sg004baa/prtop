@@ -2,6 +2,7 @@ pub mod app;
 pub mod colors;
 pub mod config;
 pub mod diff;
+pub mod dismiss;
 pub mod error;
 pub mod github;
 pub mod notify;

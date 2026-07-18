@@ -2,6 +2,7 @@ mod app;
 mod colors;
 mod config;
 mod diff;
+mod dismiss;
 mod error;
 mod github;
 mod notify;
@@ -9,19 +10,24 @@ mod poller;
 mod tui;
 mod types;
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chrono::Utc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use app::{App, Message, Screen};
 use config::Config;
+use dismiss::DismissStore;
 use github::client::GitHubClient;
 use notify::build_notifier;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
+    // terminal init 前にロードして、壊れた dismissed.json は起動エラーとして表示する。
+    let dismiss_store = Arc::new(Mutex::new(DismissStore::load()?));
 
     let cancel = CancellationToken::new();
     let (msg_tx, mut msg_rx) = mpsc::channel::<Message>(64);
@@ -57,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let error_tx = msg_tx.clone();
     let username = config.username.clone();
     let interval = Duration::from_secs(config.poll_interval_secs);
+    let poll_dismiss_store = dismiss_store.clone();
 
     tokio::spawn(async move {
         let error_sender = {
@@ -83,9 +90,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         poller::polling_loop(
-            client,
-            username,
-            interval,
+            poller::PollerContext {
+                client,
+                username,
+                interval,
+                dismiss_store: poll_dismiss_store,
+            },
             poll_sender,
             error_sender,
             poll_cancel,
@@ -112,6 +122,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 for n in app.pending_notifications.drain(..) {
                     notifier.notify(&n);
+                }
+                if !app.pending_dismissals.is_empty() {
+                    let mut store = dismiss_store.lock().expect("dismiss store lock poisoned");
+                    let now = Utc::now();
+                    for id in app.pending_dismissals.drain(..) {
+                        store.dismiss(id, now);
+                    }
+                    if let Err(e) = store.save() {
+                        app.update(Message::PollError(format!(
+                            "Failed to save dismissed mentions: {e}"
+                        )));
+                    }
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(200)) => {

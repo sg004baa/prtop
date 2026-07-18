@@ -1,10 +1,15 @@
+use std::collections::HashMap;
+
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde_json::json;
 
 use crate::error::AppError;
-use crate::github::query::SEARCH_PRS_QUERY;
-use crate::github::types::{CheckRunsResponse, CombinedStatusResponse, GraphQlResponse, PrNode};
-use crate::types::CiStatus;
+use crate::github::query::{self, SEARCH_PRS_QUERY};
+use crate::github::types::{
+    CheckRunsResponse, CombinedStatusResponse, GraphQlResponse, PrNode, RecentComment,
+};
+use crate::types::{CiStatus, PrId};
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
 const PAGE_SIZE: u64 = 50;
@@ -70,38 +75,7 @@ impl GitHubClient {
                 .send()
                 .await?;
 
-            let status = response.status();
-
-            if status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::FORBIDDEN
-            {
-                let retry_after = response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok());
-
-                let rate_remaining = response
-                    .headers()
-                    .get("x-ratelimit-remaining")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok());
-
-                if rate_remaining == Some(0) || retry_after.is_some() {
-                    return Err(AppError::RateLimited {
-                        retry_after_secs: retry_after.unwrap_or(60),
-                    });
-                }
-
-                let text = response.text().await.unwrap_or_default();
-                return Err(AppError::Auth(format!("{status}: {text}")));
-            }
-
-            if !status.is_success() {
-                let text = response.text().await.unwrap_or_default();
-                return Err(AppError::GraphQl(format!("{status}: {text}")));
-            }
-
+            let response = ensure_graphql_http_success(response).await?;
             let gql_response: GraphQlResponse = response.json().await?;
 
             if let Some(errors) = gql_response.errors {
@@ -123,6 +97,87 @@ impl GitHubClient {
         }
 
         Ok(all_nodes)
+    }
+
+    /// dismiss 済み mentioned PR の直近 issue コメントを一括取得する。
+    /// エイリアス付きの単一 GraphQL クエリで全 PR 分をまとめて引き、
+    /// エイリアスキーが動的なためレスポンスは serde_json::Value で手動パースする。
+    /// レビューコメント(コードコメント)内の再メンション検出は v1 スコープ外。
+    pub async fn fetch_recent_comments(
+        &self,
+        prs: &[PrId],
+    ) -> Result<HashMap<PrId, Vec<RecentComment>>, AppError> {
+        if prs.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let url = format!("{}/graphql", self.api_base);
+        let body = json!({ "query": query::recent_comments_query(prs) });
+
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let response = ensure_graphql_http_success(response).await?;
+        let value: serde_json::Value = response.json().await?;
+
+        if let Some(errors) = value.get("errors").and_then(|e| e.as_array()) {
+            let msgs: Vec<String> = errors
+                .iter()
+                .map(|e| {
+                    e.get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("unknown error")
+                        .to_string()
+                })
+                .collect();
+            return Err(AppError::GraphQl(msgs.join("; ")));
+        }
+
+        let data = value
+            .get("data")
+            .ok_or_else(|| AppError::GraphQl("No data in response".to_string()))?;
+
+        let mut result = HashMap::with_capacity(prs.len());
+        for (i, id) in prs.iter().enumerate() {
+            let nodes = data
+                .get(format!("pr{i}"))
+                .and_then(|r| r.get("pullRequest"))
+                .and_then(|p| p.get("comments"))
+                .and_then(|c| c.get("nodes"))
+                .and_then(|n| n.as_array());
+            let mut comments = Vec::new();
+            if let Some(nodes) = nodes {
+                for node in nodes {
+                    let body_text = node
+                        .get("bodyText")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let created_at = node
+                        .get("createdAt")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+                        .unwrap_or_default();
+                    let author_login = node
+                        .get("author")
+                        .and_then(|a| a.get("login"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    comments.push(RecentComment {
+                        body_text,
+                        created_at,
+                        author_login,
+                    });
+                }
+            }
+            result.insert(id.clone(), comments);
+        }
+        Ok(result)
     }
 
     /// Fetch the CI status for a commit by combining the legacy commit-status API
@@ -205,6 +260,44 @@ impl GitHubClient {
         }
         Ok(Some(response.json().await?))
     }
+}
+
+/// GraphQL エンドポイントの HTTP レベルのエラー(401/403/rate limit/その他非2xx)を
+/// [`AppError`] に分類する。成功時はレスポンスをそのまま返す。
+async fn ensure_graphql_http_success(
+    response: reqwest::Response,
+) -> Result<reqwest::Response, AppError> {
+    let status = response.status();
+
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+
+        let rate_remaining = response
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+
+        if rate_remaining == Some(0) || retry_after.is_some() {
+            return Err(AppError::RateLimited {
+                retry_after_secs: retry_after.unwrap_or(60),
+            });
+        }
+
+        let text = response.text().await.unwrap_or_default();
+        return Err(AppError::Auth(format!("{status}: {text}")));
+    }
+
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(AppError::GraphQl(format!("{status}: {text}")));
+    }
+
+    Ok(response)
 }
 
 fn compute_ci_status(

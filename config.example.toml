@@ -10,7 +10,8 @@ poll_interval_secs = 60
 # fall back to its default.
 #
 # Defaults (✅ = on, ❌ = opt-in):
-#   ✅ review_requested    — A new PR appears where you are not the author
+#   ✅ review_requested    — A new PR appears where review is requested from you
+#   ✅ mentioned           — A new PR appears where you are mentioned
 #   ✅ pr_closed           — Your authored PR transitions to closed
 #   ✅ pr_merged           — Your authored PR is merged
 #   ✅ re_review_requested — review_decision changes to ReviewRequired
@@ -21,9 +22,13 @@ poll_interval_secs = 60
 # the CI column itself is always populated. Token needs
 # `Commit statuses: Read-only` and/or `Checks: Read-only` to read CI state —
 # without them the column silently shows `-` for every PR.
+# Mentioned PRs are hidden once opened in the browser (persisted in
+# <cache_dir>/prtop/dismissed.json, e.g. ~/.cache/prtop/dismissed.json) and
+# come back only when someone mentions you again on them.
 [notify]
 enabled = false
 # review_requested    = true
+# mentioned           = true
 # pr_closed           = true
 # pr_merged           = true
 # re_review_requested = true
@@ -36,7 +41,7 @@ enabled = false
 [colors]
 app_title    = "cyan"      # "GitHub PR Live" in header
 col_header   = "dark_gray" # ROLE / # / TITLE / REPO column headers
-role         = "cyan"      # AUTHOR / REVIEW / BOTH
+role         = "cyan"      # AUTHOR / REVIEW / MENTION
 number       = "yellow"    # #1234
 repo         = "blue"      # org/repo
 new_pr       = "green"     # newly appeared PRs
