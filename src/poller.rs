@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -7,6 +8,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::dismiss::{DismissStore, contains_mention};
 use crate::error::AppError;
 use crate::github::client::{GitHubClient, MAX_PAGES};
 use crate::github::query;
@@ -59,28 +61,41 @@ fn node_to_pr(node: PrNode, role: PrRole) -> (PullRequest, String) {
     (pr, head_sha)
 }
 
+fn node_id(node: &PrNode) -> PrId {
+    PrId {
+        owner: node.repository.owner.login.clone(),
+        repo: node.repository.name.clone(),
+        number: node.number,
+    }
+}
+
 pub fn merge_and_convert(
     author_nodes: Vec<PrNode>,
     review_nodes: Vec<PrNode>,
+    mentioned_nodes: Vec<PrNode>,
 ) -> (IndexMap<PrId, PullRequest>, HashMap<PrId, String>) {
-    let mut result = IndexMap::new();
+    let mut result: IndexMap<PrId, PullRequest> = IndexMap::new();
     let mut shas: HashMap<PrId, String> = HashMap::new();
 
-    let mut author_ids: HashSet<PrId> = HashSet::new();
+    // 同一 PR が複数クエリに現れた場合は Author > ReviewRequested > Mentioned の
+    // 優先度で解決する(先に insert された方が勝つ)。
     for node in author_nodes {
         let (pr, sha) = node_to_pr(node, PrRole::Author);
-        author_ids.insert(pr.id.clone());
         shas.insert(pr.id.clone(), sha);
         result.insert(pr.id.clone(), pr);
     }
 
     for node in review_nodes {
         let (pr, sha) = node_to_pr(node, PrRole::ReviewRequested);
-        if author_ids.contains(&pr.id) {
-            if let Some(existing) = result.get_mut(&pr.id) {
-                existing.role = PrRole::Both;
-            }
-        } else {
+        if !result.contains_key(&pr.id) {
+            shas.insert(pr.id.clone(), sha);
+            result.insert(pr.id.clone(), pr);
+        }
+    }
+
+    for node in mentioned_nodes {
+        let (pr, sha) = node_to_pr(node, PrRole::Mentioned);
+        if !result.contains_key(&pr.id) {
             shas.insert(pr.id.clone(), sha);
             result.insert(pr.id.clone(), pr);
         }
@@ -118,10 +133,16 @@ async fn enrich_with_ci_status(
     }
 }
 
+/// polling_loop の実行時依存(クライアント・対象ユーザー・ポーリング間隔・dismiss 状態)。
+pub struct PollerContext {
+    pub client: GitHubClient,
+    pub username: String,
+    pub interval: Duration,
+    pub dismiss_store: Arc<Mutex<DismissStore>>,
+}
+
 pub async fn polling_loop(
-    client: GitHubClient,
-    username: String,
-    interval: Duration,
+    ctx: PollerContext,
     tx: mpsc::Sender<PollPayload>,
     error_tx: mpsc::Sender<String>,
     cancel: CancellationToken,
@@ -130,7 +151,7 @@ pub async fn polling_loop(
     let mut backoff_secs = 0u64;
 
     loop {
-        let result = poll_once(&client, &username).await;
+        let result = poll_once(&ctx.client, &ctx.username, &ctx.dismiss_store, &error_tx).await;
 
         match result {
             Ok(payload) => {
@@ -168,27 +189,36 @@ pub async fn polling_loop(
 
         // Wait for next interval or manual refresh
         tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(ctx.interval) => {}
             _ = refresh_rx.recv() => {}
             _ = cancel.cancelled() => return,
         }
     }
 }
 
-async fn poll_once(client: &GitHubClient, username: &str) -> Result<PollPayload, AppError> {
+async fn poll_once(
+    client: &GitHubClient,
+    username: &str,
+    dismiss_store: &Mutex<DismissStore>,
+    error_tx: &mpsc::Sender<String>,
+) -> Result<PollPayload, AppError> {
     let author_open_query = query::author_search_query(username);
     let author_closed_query = query::author_closed_search_query(username);
     let review_open_query = query::review_requested_search_query(username);
     let review_closed_query = query::review_requested_closed_search_query(username);
+    let mentions_open_query = query::mentions_search_query(username);
+    let mentions_closed_query = query::mentions_closed_search_query(username);
 
-    // Run all four queries in parallel.
+    // Run all six queries in parallel.
     // Open queries are fully paginated to ensure no active PRs are missed.
     // Closed/merged queries fetch only one page (the most recently updated ones).
-    let (author_open, author_closed, review_open, review_closed) = tokio::join!(
+    let (author_open, author_closed, review_open, review_closed, mentions_open, mentions_closed) = tokio::join!(
         client.search_prs(&author_open_query, MAX_PAGES),
         client.search_prs(&author_closed_query, 1),
         client.search_prs(&review_open_query, MAX_PAGES),
         client.search_prs(&review_closed_query, 1),
+        client.search_prs(&mentions_open_query, MAX_PAGES),
+        client.search_prs(&mentions_closed_query, 1),
     );
 
     let mut author_nodes = author_open?;
@@ -197,7 +227,75 @@ async fn poll_once(client: &GitHubClient, username: &str) -> Result<PollPayload,
     let mut review_nodes = review_open?;
     review_nodes.extend(review_closed?);
 
-    let (mut prs, shas) = merge_and_convert(author_nodes, review_nodes);
+    let mut mentioned_nodes = mentions_open?;
+    mentioned_nodes.extend(mentions_closed?);
+
+    let mention_ids: HashSet<PrId> = mentioned_nodes.iter().map(node_id).collect();
+
+    let (mut prs, shas) = merge_and_convert(author_nodes, review_nodes, mentioned_nodes);
+
+    // mentions クエリに出なくなった PR の dismiss エントリは掃除する。
+    // 全クエリ成功後(`?` の後)なので、エラー時に誤って掃除されることはない。
+    // ロックは std::sync::Mutex のため await を跨がないよう、スナップショットを取ってすぐ手放す。
+    let dismissed = {
+        let mut store = dismiss_store.lock().expect("dismiss store lock poisoned");
+        store.retain_ids(&mention_ids);
+        store.snapshot()
+    };
+
+    // dismiss 後に更新があった mentioned PR だけ、直近 issue コメントを見て
+    // 再メンションを検証する(レビューコメント内の再メンション検出は v1 スコープ外)。
+    let candidates: Vec<(PrId, DateTime<Utc>)> = prs
+        .iter()
+        .filter(|(_, pr)| pr.role == PrRole::Mentioned)
+        .filter_map(|(id, pr)| {
+            let dismissed_at = *dismissed.get(id)?;
+            (pr.updated_at > dismissed_at).then(|| (id.clone(), dismissed_at))
+        })
+        .collect();
+
+    let mut undismissed: HashSet<PrId> = HashSet::new();
+    if !candidates.is_empty() {
+        let ids: Vec<PrId> = candidates.iter().map(|(id, _)| id.clone()).collect();
+        // 再メンション検証は best-effort: 失敗しても poll 全体は落とさず、
+        // 該当 PR はこのポーリングでは dismissed のまま維持する。
+        match client.fetch_recent_comments(&ids).await {
+            Ok(comments) => {
+                for (id, dismissed_at) in &candidates {
+                    let re_mentioned = comments.get(id).is_some_and(|list| {
+                        list.iter().any(|c| {
+                            c.created_at > *dismissed_at
+                                && !c
+                                    .author_login
+                                    .as_deref()
+                                    .is_some_and(|a| a.eq_ignore_ascii_case(username))
+                                && contains_mention(&c.body_text, username)
+                        })
+                    });
+                    if re_mentioned {
+                        undismissed.insert(id.clone());
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = error_tx.send(format!("Mention re-check failed: {e}")).await;
+            }
+        }
+    }
+
+    let still_dismissed = {
+        let mut store = dismiss_store.lock().expect("dismiss store lock poisoned");
+        for id in &undismissed {
+            store.undismiss(id);
+        }
+        if store.is_dirty() {
+            store.save()?;
+        }
+        store.dismissed_ids()
+    };
+
+    // dismiss されたままの Mentioned ロール PR はリストに出さない。
+    prs.retain(|id, pr| pr.role != PrRole::Mentioned || !still_dismissed.contains(id));
 
     enrich_with_ci_status(client, &mut prs, shas).await;
 
@@ -248,8 +346,7 @@ mod tests {
     #[test]
     fn merge_author_only() {
         let author = vec![make_node("org", "repo", 1)];
-        let review = vec![];
-        let (result, _) = merge_and_convert(author, review);
+        let (result, _) = merge_and_convert(author, vec![], vec![]);
         assert_eq!(result.len(), 1);
         let pr = result.values().next().unwrap();
         assert_eq!(pr.role, PrRole::Author);
@@ -257,30 +354,50 @@ mod tests {
 
     #[test]
     fn merge_review_only() {
-        let author = vec![];
         let review = vec![make_node("org", "repo", 1)];
-        let (result, _) = merge_and_convert(author, review);
+        let (result, _) = merge_and_convert(vec![], review, vec![]);
         assert_eq!(result.len(), 1);
         let pr = result.values().next().unwrap();
         assert_eq!(pr.role, PrRole::ReviewRequested);
     }
 
     #[test]
-    fn merge_both_roles() {
-        let author = vec![make_node("org", "repo", 1)];
-        let review = vec![make_node("org", "repo", 1)];
-        let (result, _) = merge_and_convert(author, review);
+    fn merge_mentioned_only() {
+        let mentioned = vec![make_node("org", "repo", 1)];
+        let (result, _) = merge_and_convert(vec![], vec![], mentioned);
         assert_eq!(result.len(), 1);
         let pr = result.values().next().unwrap();
-        assert_eq!(pr.role, PrRole::Both);
+        assert_eq!(pr.role, PrRole::Mentioned);
+    }
+
+    #[test]
+    fn merge_author_wins_over_review_and_mentioned() {
+        let author = vec![make_node("org", "repo", 1)];
+        let review = vec![make_node("org", "repo", 1)];
+        let mentioned = vec![make_node("org", "repo", 1)];
+        let (result, _) = merge_and_convert(author, review, mentioned);
+        assert_eq!(result.len(), 1);
+        let pr = result.values().next().unwrap();
+        assert_eq!(pr.role, PrRole::Author);
+    }
+
+    #[test]
+    fn merge_review_wins_over_mentioned() {
+        let review = vec![make_node("org", "repo", 1)];
+        let mentioned = vec![make_node("org", "repo", 1)];
+        let (result, _) = merge_and_convert(vec![], review, mentioned);
+        assert_eq!(result.len(), 1);
+        let pr = result.values().next().unwrap();
+        assert_eq!(pr.role, PrRole::ReviewRequested);
     }
 
     #[test]
     fn merge_distinct_prs() {
         let author = vec![make_node("org", "repo", 1)];
         let review = vec![make_node("org", "repo", 2)];
-        let (result, _) = merge_and_convert(author, review);
-        assert_eq!(result.len(), 2);
+        let mentioned = vec![make_node("org", "repo", 3)];
+        let (result, _) = merge_and_convert(author, review, mentioned);
+        assert_eq!(result.len(), 3);
     }
 
     // --- parse_state ---
@@ -389,6 +506,15 @@ mod tests {
         })
     }
 
+    fn test_dismiss_store(name: &str) -> Arc<Mutex<DismissStore>> {
+        let path = std::env::temp_dir().join(format!(
+            "prtop-poller-test-{name}-{}-{}.json",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        Arc::new(Mutex::new(DismissStore::load_from(path).unwrap()))
+    }
+
     #[tokio::test]
     async fn polling_loop_stops_on_cancel() {
         let server = MockServer::start().await;
@@ -406,9 +532,12 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             polling_loop(
-                client,
-                "user".to_string(),
-                Duration::from_secs(3600),
+                PollerContext {
+                    client,
+                    username: "user".to_string(),
+                    interval: Duration::from_secs(3600),
+                    dismiss_store: test_dismiss_store("cancel"),
+                },
                 tx,
                 err_tx,
                 cancel_clone,
@@ -448,9 +577,12 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             polling_loop(
-                client,
-                "user".to_string(),
-                Duration::from_secs(60),
+                PollerContext {
+                    client,
+                    username: "user".to_string(),
+                    interval: Duration::from_secs(60),
+                    dismiss_store: test_dismiss_store("auth"),
+                },
                 tx,
                 err_tx,
                 cancel_clone,
@@ -494,9 +626,12 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             polling_loop(
-                client,
-                "user".to_string(),
-                Duration::from_secs(3600),
+                PollerContext {
+                    client,
+                    username: "user".to_string(),
+                    interval: Duration::from_secs(3600),
+                    dismiss_store: test_dismiss_store("refresh"),
+                },
                 tx,
                 err_tx,
                 cancel_clone,

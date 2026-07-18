@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +50,15 @@ pub struct CommentsConnection {
     pub total_count: u64,
     #[serde(default)]
     pub nodes: Vec<CommentNode>,
+}
+
+/// [`crate::github::client::GitHubClient::fetch_recent_comments`] が返す直近コメント。
+/// レスポンスはエイリアスキーが動的なため serde ではなく手動パースで組み立てる。
+#[derive(Debug, Clone)]
+pub struct RecentComment {
+    pub body_text: String,
+    pub created_at: DateTime<Utc>,
+    pub author_login: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

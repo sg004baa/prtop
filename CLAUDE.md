@@ -29,7 +29,7 @@ cargo test
 
 ## Architecture
 
-Terminal-resident TUI app that monitors GitHub PRs you're involved in (as author or reviewer), using The Elm Architecture (TEA) pattern.
+Terminal-resident TUI app that monitors GitHub PRs you're involved in (as author, reviewer, or mentioned user), using The Elm Architecture (TEA) pattern.
 
 ### Async Task Model
 
@@ -47,7 +47,11 @@ The main loop only redraws when `app.dirty` is true. `CancellationToken` coordin
 
 ### GitHub API (github/)
 
-Two GraphQL search queries (`author:{user}` and `review-requested:{user}`) are executed in parallel via `tokio::join!`, then merged in `poller::merge_and_convert()`. Same PR appearing in both queries gets `PrRole::Both`. Pagination follows `endCursor` up to 4 pages (200 items max).
+Three GraphQL search queries (`author:{user}`, `review-requested:{user}`, `mentions:{user}`), each with an open and a closed variant (six searches total), are executed in parallel via `tokio::join!`, then merged in `poller::merge_and_convert()`. A PR appearing in multiple queries resolves its role by priority `Author > ReviewRequested > Mentioned`. Pagination follows `endCursor` up to 4 pages (200 items max).
+
+### Mention Dismissals (dismiss.rs)
+
+Mentioned-role PRs are dismissed when opened in the browser (`Message::OpenSelected`): `App.pending_dismissals` is drained by the main loop into `DismissStore`, persisted at `<cache_dir>/prtop/dismissed.json` (`{"owner/repo#123": "<RFC3339>"}`). The poller hides still-dismissed mentioned PRs, prunes entries no longer returned by the mentions queries, and un-dismisses a PR when a newer issue comment by someone else contains `@username` (checked via `fetch_recent_comments`, an alias-batched GraphQL query; review-thread comments are out of scope). The store is shared as `Arc<std::sync::Mutex<DismissStore>>`; locks are never held across `.await`.
 
 ### Error Classification (error.rs)
 
@@ -59,7 +63,8 @@ Two GraphQL search queries (`author:{user}` and `review-requested:{user}`) are e
 
 Notification triggers (only after initial load, checked in `Message::PollResult` handler):
 - `removed` + `role == Author` → "PR closed/merged"
-- `added` + `role != Author` → "Review requested"
+- `added` + `role == ReviewRequested` → "Review requested"
+- `added` + `role == Mentioned` → "Mentioned in PR"
 - `updated` + `review_decision` changed to `ReviewRequired` → "Re-review requested"
 
 ### Key Data Structures
@@ -74,4 +79,4 @@ CLI args > env vars (`PRTOP_GITHUB_TOKEN`, `PRTOP_GITHUB_USERNAME`) > `~/.config
 
 Config keys: `github_token`, `username`, `poll_interval_secs`, `[notify].enabled`, plus per-event toggles under `[notify]`.
 
-Per-event toggles: `review_requested`, `pr_closed`, `pr_merged`, `re_review_requested`, `new_comment`, `ci_finished`. All default `true` except `ci_finished` (default `false`). Omit a key to use its default. `enabled = false` is a global kill switch (defaults to `false`). `ci_finished` only controls the notification — CI status is always fetched per poll to populate the `CI` column. Token needs `commit_statuses: read` and/or `checks: read` to actually see CI state; without those scopes the calls 403/404 silently.
+Per-event toggles: `review_requested`, `mentioned`, `pr_closed`, `pr_merged`, `re_review_requested`, `new_comment`, `ci_finished`. All default `true` except `ci_finished` (default `false`). Omit a key to use its default. `enabled = false` is a global kill switch (defaults to `false`). `ci_finished` only controls the notification — CI status is always fetched per poll to populate the `CI` column. Token needs `commit_statuses: read` and/or `checks: read` to actually see CI state; without those scopes the calls 403/404 silently.

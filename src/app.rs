@@ -54,6 +54,9 @@ pub struct App {
     pub dirty: bool,
     pub last_activity: Option<Instant>,
     pub pending_notifications: Vec<Notification>,
+    /// ブラウザで開いて既読扱いになった Mentioned PR。main ループが drain して
+    /// DismissStore へ永続化する(pending_notifications と同じ drain パターン)。
+    pub pending_dismissals: Vec<PrId>,
     pub notify_events: HashSet<NotifyEvent>,
     pub colors: ColorScheme,
     pub username: String,
@@ -76,6 +79,7 @@ impl App {
             dirty: true,
             last_activity: None,
             pending_notifications: Vec::new(),
+            pending_dismissals: Vec::new(),
             notify_events,
             colors,
             username,
@@ -148,14 +152,28 @@ impl App {
                 if let Some(i) = self.list_state.selected()
                     && let Some((id, pr)) = self.prs.get_index(i)
                 {
-                    let removed_new = self.new_pr_ids.remove(id);
-                    let removed_comment = self.new_comment_pr_ids.remove(id);
+                    let id = id.clone();
+                    let removed_new = self.new_pr_ids.remove(&id);
+                    let removed_comment = self.new_comment_pr_ids.remove(&id);
                     if removed_new || removed_comment {
                         self.dirty = true;
                     }
                     let url = pr.url.clone();
+                    let is_mentioned = pr.role == PrRole::Mentioned;
                     if open::that(&url).is_err() {
                         self.status_message = Some(format!("Failed to open browser: {url}"));
+                        self.dirty = true;
+                    }
+                    if is_mentioned {
+                        // Mentioned PR は開いた時点で既読とみなしてリストから外し、
+                        // 永続 dismiss キューに積む。選択は同じ行位置の PR に再解決する。
+                        self.pending_dismissals.push(id.clone());
+                        self.prs.shift_remove(&id);
+                        if self.prs.is_empty() {
+                            self.list_state.select(None);
+                        } else {
+                            self.list_state.select(Some(i.min(self.prs.len() - 1)));
+                        }
                         self.dirty = true;
                     }
                 }
@@ -205,16 +223,26 @@ impl App {
                 let diff = diff_pr_sets(&self.prs, &incoming);
 
                 if already_loaded {
-                    // New PR added: only notify when we are NOT the author (review request)
+                    // New PR added: notify based on our role on it (author gets no notification)
                     for id in &diff.added {
-                        if let Some(pr) = incoming.get(id)
-                            && pr.role != PrRole::Author
-                            && self.notify_events.contains(&NotifyEvent::ReviewRequested)
-                        {
-                            self.pending_notifications.push(Notification {
-                                title: "Review requested".to_string(),
-                                body: format!("{} ({})", pr.title, id),
-                            });
+                        if let Some(pr) = incoming.get(id) {
+                            let notification = match pr.role {
+                                PrRole::ReviewRequested => {
+                                    Some(("Review requested", NotifyEvent::ReviewRequested))
+                                }
+                                PrRole::Mentioned => {
+                                    Some(("Mentioned in PR", NotifyEvent::Mentioned))
+                                }
+                                PrRole::Author => None,
+                            };
+                            if let Some((title, event)) = notification
+                                && self.notify_events.contains(&event)
+                            {
+                                self.pending_notifications.push(Notification {
+                                    title: title.to_string(),
+                                    body: format!("{} ({})", pr.title, id),
+                                });
+                            }
                         }
                     }
 
@@ -263,7 +291,7 @@ impl App {
                     for (id, new_pr) in &incoming {
                         if let Some(old_pr) = self.prs.get(id)
                             && new_pr.total_comments > old_pr.total_comments
-                            && matches!(new_pr.role, PrRole::Author | PrRole::Both)
+                            && new_pr.role == PrRole::Author
                             && new_pr.last_commenter.as_deref() != Some(self.username.as_str())
                         {
                             if self.notify_events.contains(&NotifyEvent::NewComment) {
@@ -279,7 +307,7 @@ impl App {
                     // CI status change: notify author when CI transitions from in-progress to finished
                     for (id, new_pr) in &incoming {
                         if let Some(old_pr) = self.prs.get(id)
-                            && matches!(new_pr.role, PrRole::Author | PrRole::Both)
+                            && new_pr.role == PrRole::Author
                             && old_pr
                                 .ci_status
                                 .as_ref()
@@ -1300,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn comment_increase_on_both_role_pr_triggers_notification() {
+    fn comment_increase_on_mentioned_role_pr_no_notification() {
         let mut app = App::new(
             "testuser".to_string(),
             ColorScheme::default(),
@@ -1310,19 +1338,127 @@ mod tests {
         let mut prs = IndexMap::new();
         prs.insert(
             id.clone(),
-            make_pr_with_comments(&id, PrRole::Both, None, 0, 0),
+            make_pr_with_comments(&id, PrRole::Mentioned, None, 0, 0),
         );
         app.update(Message::PollResult(payload_from(prs)));
 
         let mut prs2 = IndexMap::new();
         prs2.insert(
             id.clone(),
-            make_pr_with_comments(&id, PrRole::Both, None, 100, 2),
+            make_pr_with_comments(&id, PrRole::Mentioned, None, 100, 2),
         );
         app.update(Message::PollResult(payload_from(prs2)));
 
+        assert!(
+            app.pending_notifications.is_empty(),
+            "comment notification is author-only"
+        );
+    }
+
+    // --- Mentioned role ---
+
+    #[test]
+    fn added_mentioned_pr_triggers_mentioned_notification() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        app.update(Message::PollResult(payload_from(IndexMap::new())));
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(id.clone(), make_pr_custom(&id, PrRole::Mentioned, None, 0));
+        app.update(Message::PollResult(payload_from(prs)));
         assert_eq!(app.pending_notifications.len(), 1);
-        assert_eq!(app.pending_notifications[0].title, "New comment");
+        assert_eq!(app.pending_notifications[0].title, "Mentioned in PR");
+    }
+
+    #[test]
+    fn disabled_mentioned_suppresses_notification() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            events_except(NotifyEvent::Mentioned),
+        );
+        app.update(Message::PollResult(payload_from(IndexMap::new())));
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(id.clone(), make_pr_custom(&id, PrRole::Mentioned, None, 0));
+        app.update(Message::PollResult(payload_from(prs)));
+        assert!(app.pending_notifications.is_empty());
+    }
+
+    #[test]
+    fn open_selected_mentioned_pr_queues_dismissal_and_removes_from_list() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id_mentioned = make_id(1);
+        let id_author = make_id(2);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id_mentioned.clone(),
+            make_pr_custom(&id_mentioned, PrRole::Mentioned, None, 0),
+        );
+        prs.insert(
+            id_author.clone(),
+            make_pr_custom(&id_author, PrRole::Author, None, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+        app.update(Message::MoveDown); // select index 0 (mentioned)
+
+        app.update(Message::OpenSelected);
+
+        assert_eq!(app.pending_dismissals, vec![id_mentioned.clone()]);
+        assert!(!app.prs.contains_key(&id_mentioned));
+        // 選択は同じ行位置の残り PR に再解決される
+        assert_eq!(app.list_state.selected(), Some(0));
+        assert!(app.prs.contains_key(&id_author));
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn open_selected_last_mentioned_pr_clears_selection() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(id.clone(), make_pr_custom(&id, PrRole::Mentioned, None, 0));
+        app.update(Message::PollResult(payload_from(prs)));
+        app.update(Message::MoveDown);
+
+        app.update(Message::OpenSelected);
+
+        assert_eq!(app.pending_dismissals, vec![id]);
+        assert!(app.prs.is_empty());
+        assert_eq!(app.list_state.selected(), None);
+    }
+
+    #[test]
+    fn open_selected_non_mentioned_pr_does_not_queue_dismissal() {
+        let mut app = App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            NotifyEvent::all(),
+        );
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_custom(&id, PrRole::ReviewRequested, None, 0),
+        );
+        app.update(Message::PollResult(payload_from(prs)));
+        app.update(Message::MoveDown);
+
+        app.update(Message::OpenSelected);
+
+        assert!(app.pending_dismissals.is_empty());
+        assert!(app.prs.contains_key(&id));
     }
 
     #[test]
@@ -1795,7 +1931,7 @@ mod tests {
     }
 
     #[test]
-    fn ci_notification_for_both_role() {
+    fn ci_notification_not_for_mentioned_role() {
         let mut app = App::new(
             "testuser".to_string(),
             ColorScheme::default(),
@@ -1805,19 +1941,21 @@ mod tests {
         let mut prs = IndexMap::new();
         prs.insert(
             id.clone(),
-            make_pr_with_ci(&id, PrRole::Both, 0, Some(CiStatus::Pending)),
+            make_pr_with_ci(&id, PrRole::Mentioned, 0, Some(CiStatus::Pending)),
         );
         app.update(Message::PollResult(payload_from(prs)));
 
         let mut prs2 = IndexMap::new();
         prs2.insert(
             id.clone(),
-            make_pr_with_ci(&id, PrRole::Both, 100, Some(CiStatus::Failure)),
+            make_pr_with_ci(&id, PrRole::Mentioned, 100, Some(CiStatus::Failure)),
         );
         app.update(Message::PollResult(payload_from(prs2)));
 
-        assert_eq!(app.pending_notifications.len(), 1);
-        assert_eq!(app.pending_notifications[0].title, "CI failed");
+        assert!(
+            app.pending_notifications.is_empty(),
+            "CI notification is author-only"
+        );
     }
 
     #[test]

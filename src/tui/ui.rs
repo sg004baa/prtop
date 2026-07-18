@@ -20,7 +20,7 @@ pub fn view(f: &mut Frame, app: &mut App) {
 /// Layout: [▸ ][role][  ][status][  ][ci][  ][number][title][  ][repo]
 fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize, usize, usize) {
     let effective = (term_width as usize).saturating_sub(2); // 2 for "▸ " / "  "
-    let role: usize = 6; // "AUTHOR", "REVIEW", "BOTH  "
+    let role: usize = 7; // "AUTHOR ", "REVIEW ", "MENTION"
     let status: usize = 6; // "OPEN  ", "CLOSED", "MERGED"
     let ci: usize = 3; // "✓  ", "×  ", "...", "-  "
     let number: usize = 7; // "#12345 "
@@ -176,7 +176,7 @@ fn render_list(
             let role_tag = match pr.role {
                 PrRole::Author => "AUTHOR",
                 PrRole::ReviewRequested => "REVIEW",
-                PrRole::Both => "BOTH",
+                PrRole::Mentioned => "MENTION",
             };
 
             let (status_tag, status_style) = match pr.state {
