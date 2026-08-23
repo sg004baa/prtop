@@ -9,6 +9,7 @@ mod notify;
 mod poller;
 mod tui;
 mod types;
+mod ui_state;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -22,12 +23,14 @@ use config::Config;
 use dismiss::DismissStore;
 use github::client::GitHubClient;
 use notify::build_notifier;
+use ui_state::UiStateStore;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     // terminal init 前にロードして、壊れた dismissed.json は起動エラーとして表示する。
     let dismiss_store = Arc::new(Mutex::new(DismissStore::load()?));
+    let mut ui_state = UiStateStore::load()?;
 
     let cancel = CancellationToken::new();
     let (msg_tx, mut msg_rx) = mpsc::channel::<Message>(64);
@@ -47,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.username.clone(),
         config.color_scheme.clone(),
         config.notify_events.clone(),
+        ui_state.collapsed_roles().clone(),
     );
 
     // Spawn event reader
@@ -117,6 +121,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let is_refresh =
                     matches!(msg, Message::Refresh) && app.screen != Screen::Help;
                 app.update(msg);
+                if app.ui_state_dirty {
+                    app.ui_state_dirty = false;
+                    if let Err(e) = ui_state.save(&app.collapsed_roles) {
+                        app.update(Message::PollError(format!(
+                            "Failed to save UI state: {e}"
+                        )));
+                    }
+                }
                 if is_refresh {
                     let _ = refresh_tx.send(()).await;
                 }

@@ -42,7 +42,8 @@ fn key_to_message(key: KeyEvent) -> Option<Message> {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Message::Quit),
         KeyCode::Up | KeyCode::Char('k') => Some(Message::MoveUp),
         KeyCode::Down | KeyCode::Char('j') => Some(Message::MoveDown),
-        KeyCode::Enter | KeyCode::Char('o') => Some(Message::OpenSelected),
+        KeyCode::Enter => Some(Message::ActivateSelected),
+        KeyCode::Char('o') => Some(Message::OpenSelected),
         KeyCode::Char('?') => Some(Message::ToggleHelp),
         KeyCode::Char('r') => Some(Message::Refresh),
         _ => None,
@@ -68,6 +69,14 @@ mod tests {
         assert!(matches!(
             key_to_message(key(KeyCode::Char('j'), KeyEventKind::Press)),
             Some(Message::MoveDown)
+        ));
+        assert!(matches!(
+            key_to_message(key(KeyCode::Enter, KeyEventKind::Press)),
+            Some(Message::ActivateSelected)
+        ));
+        assert!(matches!(
+            key_to_message(key(KeyCode::Char('o'), KeyEventKind::Press)),
+            Some(Message::OpenSelected)
         ));
     }
 

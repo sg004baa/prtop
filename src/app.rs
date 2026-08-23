@@ -26,11 +26,19 @@ pub enum LoadingState {
     Loaded,
     Error(String),
 }
+pub const ROLE_ORDER: [PrRole; 3] = [PrRole::Author, PrRole::ReviewRequested, PrRole::Mentioned];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VisibleRow {
+    Role(PrRole),
+    Pr(PrId),
+}
 
 pub enum Message {
     Quit,
     MoveUp,
     MoveDown,
+    ActivateSelected,
     OpenSelected,
     ToggleHelp,
     Refresh,
@@ -42,6 +50,9 @@ pub enum Message {
 pub struct App {
     pub prs: IndexMap<PrId, PullRequest>,
     pub list_state: ListState,
+    pub visible_rows: Vec<VisibleRow>,
+    pub collapsed_roles: HashSet<PrRole>,
+    pub ui_state_dirty: bool,
     pub screen: Screen,
     pub loading: LoadingState,
     pub last_poll: Option<DateTime<Utc>>,
@@ -63,10 +74,18 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(username: String, colors: ColorScheme, notify_events: HashSet<NotifyEvent>) -> Self {
-        Self {
+    pub fn new(
+        username: String,
+        colors: ColorScheme,
+        notify_events: HashSet<NotifyEvent>,
+        collapsed_roles: HashSet<PrRole>,
+    ) -> Self {
+        let mut app = Self {
             prs: IndexMap::new(),
             list_state: ListState::default(),
+            visible_rows: Vec::new(),
+            collapsed_roles,
+            ui_state_dirty: false,
             screen: Screen::PrList,
             loading: LoadingState::Initial,
             last_poll: None,
@@ -83,7 +102,9 @@ impl App {
             notify_events,
             colors,
             username,
-        }
+        };
+        app.rebuild_visible_rows(None);
+        app
     }
 
     pub fn update(&mut self, msg: Message) {
@@ -111,18 +132,13 @@ impl App {
                 self.dirty = true;
             }
             Message::MoveUp => {
-                if self.prs.is_empty() {
+                if !matches!(self.loading, LoadingState::Loaded) {
                     return;
                 }
                 let prev_id = self.selected_id();
                 let target = match self.list_state.selected() {
-                    Some(i) => {
-                        if i == 0 {
-                            self.prs.len() - 1
-                        } else {
-                            i - 1
-                        }
-                    }
+                    Some(0) => self.visible_rows.len() - 1,
+                    Some(i) => i - 1,
                     None => 0,
                 };
                 self.move_focus_to(target, prev_id);
@@ -130,53 +146,29 @@ impl App {
                 self.dirty = true;
             }
             Message::MoveDown => {
-                if self.prs.is_empty() {
+                if !matches!(self.loading, LoadingState::Loaded) {
                     return;
                 }
                 let prev_id = self.selected_id();
                 let target = match self.list_state.selected() {
-                    Some(i) => {
-                        if i >= self.prs.len() - 1 {
-                            0
-                        } else {
-                            i + 1
-                        }
-                    }
+                    Some(i) if i >= self.visible_rows.len() - 1 => 0,
+                    Some(i) => i + 1,
                     None => 0,
                 };
                 self.move_focus_to(target, prev_id);
                 self.last_activity = Some(Instant::now());
                 self.dirty = true;
             }
-            Message::OpenSelected => {
-                if let Some(i) = self.list_state.selected()
-                    && let Some((id, pr)) = self.prs.get_index(i)
-                {
-                    let id = id.clone();
-                    let removed_new = self.new_pr_ids.remove(&id);
-                    let removed_comment = self.new_comment_pr_ids.remove(&id);
-                    if removed_new || removed_comment {
-                        self.dirty = true;
-                    }
-                    let url = pr.url.clone();
-                    let is_mentioned = pr.role == PrRole::Mentioned;
-                    if open::that(&url).is_err() {
-                        self.status_message = Some(format!("Failed to open browser: {url}"));
-                        self.dirty = true;
-                    }
-                    if is_mentioned {
-                        // Mentioned PR は開いた時点で既読とみなしてリストから外し、
-                        // 永続 dismiss キューに積む。選択は同じ行位置の PR に再解決する。
-                        self.pending_dismissals.push(id.clone());
-                        self.prs.shift_remove(&id);
-                        if self.prs.is_empty() {
-                            self.list_state.select(None);
-                        } else {
-                            self.list_state.select(Some(i.min(self.prs.len() - 1)));
-                        }
-                        self.dirty = true;
-                    }
+            Message::ActivateSelected => {
+                match self.selected_row().cloned() {
+                    Some(VisibleRow::Role(role)) => self.toggle_role(role),
+                    Some(VisibleRow::Pr(_)) => self.open_selected_pr(),
+                    None => {}
                 }
+                self.last_activity = Some(Instant::now());
+            }
+            Message::OpenSelected => {
+                self.open_selected_pr();
                 self.last_activity = Some(Instant::now());
             }
             Message::ToggleHelp => {
@@ -193,9 +185,13 @@ impl App {
                 self.dirty = true;
             }
             Message::Deselect => {
-                if let Some(prev_id) = self.selected_id() {
+                if self.list_state.selected().is_some() {
+                    let prev_id = self.selected_id();
                     self.list_state.select(None);
-                    self.dismiss_if_done(&prev_id);
+                    if let Some(prev_id) = prev_id {
+                        self.dismiss_if_done(&prev_id);
+                        self.rebuild_visible_rows(None);
+                    }
                     self.dirty = true;
                 }
             }
@@ -334,13 +330,12 @@ impl App {
                 // Prune new_comment_pr_ids for PRs no longer in the list
                 self.new_comment_pr_ids
                     .retain(|id| incoming.contains_key(id));
-                // 選択は行番号ではなく PR に追従させる。ポーリングで順序が変わったり
-                // 件数が減ったりしても、ハイライトが別の PR に飛ばないように ID で再解決する。
-                let selected = self.selected_id();
+                // Selection follows a stable visible-row identity, not an index. This keeps role
+                // headers and PRs attached across deterministic re-sorts and poll rebuilds.
+                let selected = self.selected_row().cloned();
                 self.prs = incoming;
-                if let Some(id) = selected {
-                    self.list_state.select(self.prs.get_index_of(&id));
-                }
+                sort_prs(&mut self.prs);
+                self.rebuild_visible_rows(selected);
                 self.last_poll = Some(payload.polled_at);
                 self.poll_error = None;
                 self.status_message = None;
@@ -364,21 +359,89 @@ impl App {
     }
 
     fn selected_id(&self) -> Option<PrId> {
-        self.list_state
-            .selected()
-            .and_then(|i| self.prs.get_index(i).map(|(id, _)| id.clone()))
+        match self.selected_row() {
+            Some(VisibleRow::Pr(id)) => Some(id.clone()),
+            _ => None,
+        }
     }
 
-    /// 新しい PR にフォーカス移動する。
-    /// - 直前にフォーカスしていた `prev_id` が closed/merged ならリストから削除する。
-    /// - 移動先の PR の new/comment マーカーをクリアする。
-    /// - インデックスは削除でずれるため、移動先 PR を ID で再解決して select する。
-    /// - `prev_id` と移動先が同じ PR の場合（PR が 1 件だけのラップ等）は dismiss しない。
-    fn move_focus_to(&mut self, target_idx: usize, prev_id: Option<PrId>) {
-        let target_id = self.prs.get_index(target_idx).map(|(id, _)| id.clone());
+    pub fn selected_row(&self) -> Option<&VisibleRow> {
+        self.list_state
+            .selected()
+            .and_then(|i| self.visible_rows.get(i))
+    }
 
-        if let (Some(prev_id), Some(target_id)) = (prev_id.as_ref(), target_id.as_ref())
-            && prev_id != target_id
+    pub fn role_is_collapsed(&self, role: PrRole) -> bool {
+        self.collapsed_roles.contains(&role)
+    }
+
+    fn rebuild_visible_rows(&mut self, selected: Option<VisibleRow>) {
+        self.visible_rows.clear();
+        self.visible_rows.reserve(self.prs.len() + ROLE_ORDER.len());
+        for role in ROLE_ORDER {
+            self.visible_rows.push(VisibleRow::Role(role));
+            if !self.collapsed_roles.contains(&role) {
+                self.visible_rows.extend(
+                    self.prs
+                        .iter()
+                        .filter(|(_, pr)| pr.role == role)
+                        .map(|(id, _)| VisibleRow::Pr(id.clone())),
+                );
+            }
+        }
+        self.list_state.select(
+            selected.and_then(|selected| self.visible_rows.iter().position(|row| row == &selected)),
+        );
+    }
+
+    fn toggle_role(&mut self, role: PrRole) {
+        if !self.collapsed_roles.remove(&role) {
+            self.collapsed_roles.insert(role);
+        }
+        self.rebuild_visible_rows(Some(VisibleRow::Role(role)));
+        self.ui_state_dirty = true;
+        self.dirty = true;
+    }
+
+    fn open_selected_pr(&mut self) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        let Some(pr) = self.prs.get(&id) else {
+            return;
+        };
+        let selected_idx = self.list_state.selected().unwrap_or(0);
+        let url = pr.url.clone();
+        let is_mentioned = pr.role == PrRole::Mentioned;
+
+        let removed_new = self.new_pr_ids.remove(&id);
+        let removed_comment = self.new_comment_pr_ids.remove(&id);
+        if removed_new || removed_comment {
+            self.dirty = true;
+        }
+        if open::that(&url).is_err() {
+            self.status_message = Some(format!("Failed to open browser: {url}"));
+            self.dirty = true;
+        }
+        if is_mentioned {
+            self.pending_dismissals.push(id.clone());
+            self.prs.shift_remove(&id);
+            self.rebuild_visible_rows(None);
+            self.list_state
+                .select(Some(selected_idx.min(self.visible_rows.len() - 1)));
+            self.dirty = true;
+        }
+    }
+
+    fn move_focus_to(&mut self, target_idx: usize, prev_id: Option<PrId>) {
+        let target = self.visible_rows.get(target_idx).cloned();
+        let target_id = match &target {
+            Some(VisibleRow::Pr(id)) => Some(id.clone()),
+            _ => None,
+        };
+
+        if prev_id.as_ref() != target_id.as_ref()
+            && let Some(prev_id) = prev_id.as_ref()
         {
             self.dismiss_if_done(prev_id);
         }
@@ -386,15 +449,8 @@ impl App {
         if let Some(target_id) = target_id {
             self.new_pr_ids.remove(&target_id);
             self.new_comment_pr_ids.remove(&target_id);
-            if let Some(idx) = self.prs.get_index_of(&target_id) {
-                self.list_state.select(Some(idx));
-                return;
-            }
         }
-
-        if self.prs.is_empty() {
-            self.list_state.select(None);
-        }
+        self.rebuild_visible_rows(target);
     }
 
     /// `id` の PR が closed/merged ならリストから削除し、再ポーリングで再登場しないよう dismiss 集合に積む。
@@ -411,9 +467,25 @@ impl App {
 
     #[allow(dead_code)]
     pub fn selected_pr(&self) -> Option<&PullRequest> {
-        self.list_state
-            .selected()
-            .and_then(|i| self.prs.get_index(i).map(|(_, pr)| pr))
+        self.selected_id().and_then(|id| self.prs.get(&id))
+    }
+}
+
+fn sort_prs(prs: &mut IndexMap<PrId, PullRequest>) {
+    prs.sort_by(|id_a, pr_a, id_b, pr_b| {
+        role_rank(pr_a.role)
+            .cmp(&role_rank(pr_b.role))
+            .then_with(|| id_b.repo.cmp(&id_a.repo))
+            .then_with(|| id_b.number.cmp(&id_a.number))
+            .then_with(|| id_b.owner.cmp(&id_a.owner))
+    });
+}
+
+fn role_rank(role: PrRole) -> u8 {
+    match role {
+        PrRole::Author => 0,
+        PrRole::ReviewRequested => 1,
+        PrRole::Mentioned => 2,
     }
 }
 
@@ -427,6 +499,13 @@ mod tests {
         PrId {
             owner: "org".to_string(),
             repo: "repo".to_string(),
+            number,
+        }
+    }
+    fn make_named_id(owner: &str, repo: &str, number: u64) -> PrId {
+        PrId {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
             number,
         }
     }
@@ -495,25 +574,47 @@ mod tests {
         }
         payload_from(prs)
     }
+    fn test_app(notify_events: HashSet<NotifyEvent>) -> App {
+        App::new(
+            "testuser".to_string(),
+            ColorScheme::default(),
+            notify_events,
+            HashSet::new(),
+        )
+    }
+
+    fn select_row(app: &mut App, row: VisibleRow) {
+        let index = app
+            .visible_rows
+            .iter()
+            .position(|candidate| candidate == &row)
+            .expect("test row must be visible");
+        app.list_state.select(Some(index));
+    }
+
+    fn select_pr(app: &mut App, id: &PrId) {
+        select_row(app, VisibleRow::Pr(id.clone()));
+    }
+    fn focus_pr(app: &mut App, id: &PrId) {
+        let index = app
+            .visible_rows
+            .iter()
+            .position(|row| row == &VisibleRow::Pr(id.clone()))
+            .expect("test PR must be visible");
+        let previous = app.selected_id();
+        app.move_focus_to(index, previous);
+    }
 
     #[test]
     fn quit_sets_flag() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         app.update(Message::Quit);
         assert!(app.should_quit);
     }
 
     #[test]
     fn poll_result_updates_prs() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         app.update(Message::PollResult(make_payload(3)));
         assert_eq!(app.prs.len(), 3);
         assert!(matches!(app.loading, LoadingState::Loaded));
@@ -522,34 +623,113 @@ mod tests {
 
     #[test]
     fn navigation_wraps() {
+        let mut app = test_app(NotifyEvent::all());
+        app.update(Message::PollResult(make_payload(3)));
+        assert_eq!(app.list_state.selected(), None);
+
+        // MoveUp from None selects the first navigable header.
+        app.update(Message::MoveUp);
+        assert_eq!(app.selected_row(), Some(&VisibleRow::Role(PrRole::Author)));
+
+        // Moving up from the first row wraps to the final role header.
+        app.update(Message::MoveUp);
+        assert_eq!(
+            app.selected_row(),
+            Some(&VisibleRow::Role(PrRole::Mentioned))
+        );
+
+        app.update(Message::MoveDown);
+        assert_eq!(app.selected_row(), Some(&VisibleRow::Role(PrRole::Author)));
+    }
+    #[test]
+    fn accepted_poll_is_sorted_by_role_then_descending_pr_identity() {
+        let mut app = test_app(NotifyEvent::all());
+        let author_a = make_named_id("a", "alpha", 9);
+        let author_z = make_named_id("a", "zeta", 1);
+        let review_a = make_named_id("a", "same", 2);
+        let review_z = make_named_id("z", "same", 2);
+        let mention = make_named_id("a", "mention", 4);
+        let mut prs = IndexMap::new();
+        for (id, role) in [
+            (mention.clone(), PrRole::Mentioned),
+            (review_a.clone(), PrRole::ReviewRequested),
+            (author_a.clone(), PrRole::Author),
+            (review_z.clone(), PrRole::ReviewRequested),
+            (author_z.clone(), PrRole::Author),
+        ] {
+            prs.insert(id.clone(), make_pr_custom(&id, role, None, 0));
+        }
+
+        app.update(Message::PollResult(payload_from(prs)));
+
+        assert_eq!(
+            app.prs.keys().cloned().collect::<Vec<_>>(),
+            vec![author_z, author_a, review_z, review_a, mention]
+        );
+    }
+
+    #[test]
+    fn role_headers_toggle_children_and_keep_header_selected() {
+        let mut app = test_app(NotifyEvent::all());
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(id.clone(), make_pr_custom(&id, PrRole::Author, None, 0));
+        app.update(Message::PollResult(payload_from(prs)));
+        select_row(&mut app, VisibleRow::Role(PrRole::Author));
+
+        app.update(Message::ActivateSelected);
+
+        assert!(app.role_is_collapsed(PrRole::Author));
+        assert!(!app.visible_rows.contains(&VisibleRow::Pr(id.clone())));
+        assert_eq!(app.selected_row(), Some(&VisibleRow::Role(PrRole::Author)));
+        assert!(app.ui_state_dirty);
+
+        app.ui_state_dirty = false;
+        app.update(Message::ActivateSelected);
+        assert!(!app.role_is_collapsed(PrRole::Author));
+        assert!(app.visible_rows.contains(&VisibleRow::Pr(id)));
+        assert!(app.ui_state_dirty);
+    }
+
+    #[test]
+    fn explicit_open_is_inert_on_role_header() {
+        let mut app = test_app(NotifyEvent::all());
+        app.update(Message::PollResult(make_payload(1)));
+        select_row(&mut app, VisibleRow::Role(PrRole::Author));
+
+        app.update(Message::OpenSelected);
+
+        assert!(!app.role_is_collapsed(PrRole::Author));
+        assert!(app.pending_dismissals.is_empty());
+        assert_eq!(app.prs.len(), 1);
+    }
+
+    #[test]
+    fn reconstructed_app_honors_persisted_collapsed_roles() {
+        let id = make_id(1);
         let mut app = App::new(
             "testuser".to_string(),
             ColorScheme::default(),
             NotifyEvent::all(),
+            HashSet::from([PrRole::Author]),
         );
-        app.update(Message::PollResult(make_payload(3)));
-        assert_eq!(app.list_state.selected(), None);
+        let mut prs = IndexMap::new();
+        prs.insert(id.clone(), make_pr_custom(&id, PrRole::Author, None, 0));
+        app.update(Message::PollResult(payload_from(prs)));
 
-        // MoveUp from None → selects 0
-        app.update(Message::MoveUp);
-        assert_eq!(app.list_state.selected(), Some(0));
-
-        // MoveUp from 0 → wraps to last (2)
-        app.update(Message::MoveUp);
-        assert_eq!(app.list_state.selected(), Some(2));
-
-        // MoveDown from 2 → wraps to 0
-        app.update(Message::MoveDown);
-        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(
+            app.visible_rows,
+            vec![
+                VisibleRow::Role(PrRole::Author),
+                VisibleRow::Role(PrRole::ReviewRequested),
+                VisibleRow::Role(PrRole::Mentioned),
+            ]
+        );
     }
 
     #[test]
     fn toggle_help() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         assert_eq!(app.screen, Screen::PrList);
         app.update(Message::ToggleHelp);
         assert_eq!(app.screen, Screen::Help);
@@ -559,11 +739,7 @@ mod tests {
 
     #[test]
     fn poll_error_sets_state() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         app.update(Message::PollError("network error".to_string()));
         assert!(app.poll_error.is_some());
         assert!(matches!(app.loading, LoadingState::Error(_)));
@@ -571,11 +747,7 @@ mod tests {
 
     #[test]
     fn poll_error_clears_stale_status_message() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         app.update(Message::PollResult(make_payload(1)));
         app.update(Message::Refresh);
         assert!(app.status_message.is_some());
@@ -591,11 +763,7 @@ mod tests {
 
     #[test]
     fn no_notifications_on_first_poll() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -608,11 +776,7 @@ mod tests {
 
     #[test]
     fn closed_author_pr_triggers_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(id.clone(), make_pr_custom(&id, PrRole::Author, None, 0));
@@ -629,11 +793,7 @@ mod tests {
 
     #[test]
     fn merged_author_pr_triggers_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(id.clone(), make_pr_custom(&id, PrRole::Author, None, 0));
@@ -649,11 +809,7 @@ mod tests {
 
     #[test]
     fn closed_reviewer_pr_no_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -674,11 +830,7 @@ mod tests {
 
     #[test]
     fn focus_on_closed_pr_keeps_it_until_blur() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id_open = make_id(1);
         let id_closed = make_id(2);
 
@@ -706,30 +858,23 @@ mod tests {
         );
         app.update(Message::PollResult(payload_from(prs2)));
 
-        // Focus index 0 (open) - stays
-        app.update(Message::MoveDown);
+        // Focus the open PR first, then move onto the adjacent closed PR.
+        select_pr(&mut app, &id_open);
+        app.update(Message::MoveUp);
         assert_eq!(app.prs.len(), 2);
+        assert_eq!(app.selected_pr().unwrap().id, id_closed);
 
-        // Focus index 1 (closed) - still selectable, list unchanged
-        app.update(Message::MoveDown);
-        assert_eq!(app.prs.len(), 2);
-        assert_eq!(app.list_state.selected(), Some(1));
-
-        // Move away from the closed PR - now it gets dismissed
+        // Move away from the closed PR - now it gets dismissed.
         app.update(Message::MoveDown);
         assert_eq!(app.prs.len(), 1);
         assert!(app.prs.contains_key(&id_open));
         assert!(!app.prs.contains_key(&id_closed));
-        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(app.selected_pr().unwrap().id, id_open);
     }
 
     #[test]
     fn focus_on_merged_pr_keeps_it_until_deselect() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id_merged = make_id(1);
 
         // Initial poll: PR is open
@@ -748,10 +893,10 @@ mod tests {
         );
         app.update(Message::PollResult(payload_from(prs2)));
 
-        // Focus the merged PR - stays in the list so the user can review it
-        app.update(Message::MoveDown);
+        // Focus the merged PR - stays in the list so the user can review it.
+        select_pr(&mut app, &id_merged);
         assert_eq!(app.prs.len(), 1);
-        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(app.selected_pr().unwrap().id, id_merged);
 
         // Deselect drops focus and dismisses the merged PR
         app.update(Message::Deselect);
@@ -761,11 +906,7 @@ mod tests {
 
     #[test]
     fn move_away_from_merged_pr_removes_it() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id_open = make_id(1);
         let id_merged = make_id(2);
 
@@ -791,26 +932,20 @@ mod tests {
         );
         app.update(Message::PollResult(payload_from(prs2)));
 
-        // Step onto the merged PR
-        app.update(Message::MoveDown);
-        app.update(Message::MoveDown);
+        // Step onto the merged PR.
+        select_pr(&mut app, &id_merged);
         assert_eq!(app.prs.len(), 2);
-        assert_eq!(app.list_state.selected(), Some(1));
 
-        // Step back up — merged PR is dismissed, focus lands on the open one
-        app.update(Message::MoveUp);
+        // Step down — merged PR is dismissed, focus lands on the open one.
+        app.update(Message::MoveDown);
         assert_eq!(app.prs.len(), 1);
         assert!(!app.prs.contains_key(&id_merged));
-        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(app.selected_pr().unwrap().id, id_open);
     }
 
     #[test]
     fn added_reviewer_pr_triggers_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         app.update(Message::PollResult(payload_from(IndexMap::new())));
         let id = make_id(1);
         let mut prs = IndexMap::new();
@@ -825,11 +960,7 @@ mod tests {
 
     #[test]
     fn added_author_pr_no_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         app.update(Message::PollResult(payload_from(IndexMap::new())));
         let id = make_id(1);
         let mut prs = IndexMap::new();
@@ -840,11 +971,7 @@ mod tests {
 
     #[test]
     fn review_required_transition_triggers_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -877,11 +1004,7 @@ mod tests {
 
     #[test]
     fn already_review_required_no_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -913,11 +1036,7 @@ mod tests {
 
     #[test]
     fn dismissed_pr_does_not_reappear_after_next_poll() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id_open = make_id(1);
         let id_closed = make_id(2);
 
@@ -945,9 +1064,8 @@ mod tests {
         );
         app.update(Message::PollResult(payload_from(prs2)));
 
-        // Focus the closed PR, then move away → gets dismissed on blur
-        app.update(Message::MoveDown);
-        app.update(Message::MoveDown);
+        // Focus the closed PR, then move away → gets dismissed on blur.
+        select_pr(&mut app, &id_closed);
         app.update(Message::MoveDown);
         assert!(!app.prs.contains_key(&id_closed));
         assert!(app.dismissed_ids.contains(&id_closed));
@@ -973,11 +1091,7 @@ mod tests {
 
     #[test]
     fn dismissed_pr_reappear_does_not_trigger_review_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
 
         // Initial poll: open reviewer PR
@@ -996,8 +1110,8 @@ mod tests {
         );
         app.update(Message::PollResult(payload_from(prs2)));
 
-        // Focus the closed reviewer PR, then deselect → dismissed
-        app.update(Message::MoveDown);
+        // Focus the closed reviewer PR, then deselect → dismissed.
+        select_pr(&mut app, &id);
         app.update(Message::Deselect);
         assert!(app.dismissed_ids.contains(&id));
 
@@ -1022,11 +1136,7 @@ mod tests {
     fn closed_pr_not_tracked_in_session_does_not_appear_on_subsequent_poll() {
         // Regression: closed/merged PRs that were already closed before the session started
         // must not appear in the list, even when they arrive in a subsequent poll payload.
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id_open = make_id(1);
         let id_closing = make_id(2);
         let id_already_closed = make_id(3);
@@ -1073,25 +1183,22 @@ mod tests {
 
     #[test]
     fn selection_follows_pr_identity_across_poll_reorder() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id_a = make_id(1);
         let id_b = make_id(2);
 
         let mut prs = IndexMap::new();
         prs.insert(id_a.clone(), make_pr_custom(&id_a, PrRole::Author, None, 0));
-        prs.insert(id_b.clone(), make_pr_custom(&id_b, PrRole::Author, None, 0));
+        prs.insert(
+            id_b.clone(),
+            make_pr_custom(&id_b, PrRole::ReviewRequested, None, 0),
+        );
         app.update(Message::PollResult(payload_from(prs)));
 
-        // Select id_b (index 1)
-        app.update(Message::MoveDown);
-        app.update(Message::MoveDown);
+        select_pr(&mut app, &id_b);
         assert_eq!(app.selected_pr().unwrap().id, id_b);
 
-        // Next poll: order reversed (id_b first)
+        // The next accepted poll moves id_b to another role group.
         let mut prs2 = IndexMap::new();
         prs2.insert(id_b.clone(), make_pr_custom(&id_b, PrRole::Author, None, 0));
         prs2.insert(id_a.clone(), make_pr_custom(&id_a, PrRole::Author, None, 0));
@@ -1102,16 +1209,12 @@ mod tests {
             id_b,
             "selection must follow the PR, not the row index"
         );
-        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(app.selected_row(), Some(&VisibleRow::Pr(id_b)));
     }
 
     #[test]
     fn selection_cleared_when_selected_pr_disappears() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id_a = make_id(1);
         let id_b = make_id(2);
 
@@ -1120,9 +1223,7 @@ mod tests {
         prs.insert(id_b.clone(), make_pr_custom(&id_b, PrRole::Author, None, 0));
         app.update(Message::PollResult(payload_from(prs)));
 
-        // Select id_b (index 1)
-        app.update(Message::MoveDown);
-        app.update(Message::MoveDown);
+        select_pr(&mut app, &id_b);
 
         // Next poll: id_b is gone
         let mut prs2 = IndexMap::new();
@@ -1138,11 +1239,7 @@ mod tests {
 
     #[test]
     fn new_prs_detected() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         app.update(Message::PollResult(make_payload(2)));
         // Initial load: no markers (all PRs are "known" from the start)
         assert_eq!(app.new_pr_ids.len(), 0);
@@ -1155,13 +1252,11 @@ mod tests {
         app.update(Message::PollResult(make_payload(3)));
         assert_eq!(app.new_pr_ids.len(), 1);
 
-        // Navigating clears the focused PR's marker (index 0 = PR #0, not the new one)
-        app.update(Message::MoveDown);
+        // Focusing a known PR preserves the new PR marker.
+        focus_pr(&mut app, &make_id(0));
         assert_eq!(app.new_pr_ids.len(), 1);
 
-        // Navigate to the new PR (PR #2 at index 2)
-        app.update(Message::MoveDown);
-        app.update(Message::MoveDown);
+        focus_pr(&mut app, &make_id(2));
         assert_eq!(app.new_pr_ids.len(), 0);
     }
 
@@ -1169,11 +1264,7 @@ mod tests {
 
     #[test]
     fn comment_increase_on_author_pr_triggers_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1196,11 +1287,7 @@ mod tests {
 
     #[test]
     fn comment_increase_on_reviewer_pr_no_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1222,11 +1309,7 @@ mod tests {
 
     #[test]
     fn comment_unchanged_no_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1248,11 +1331,7 @@ mod tests {
 
     #[test]
     fn comment_increase_sets_new_comment_pr_ids() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1273,11 +1352,7 @@ mod tests {
 
     #[test]
     fn navigate_to_pr_clears_new_comment_pr_id() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1294,18 +1369,14 @@ mod tests {
         app.update(Message::PollResult(payload_from(prs2)));
         assert!(app.new_comment_pr_ids.contains(&id));
 
-        // Navigate to the PR → should clear from new_comment_pr_ids
-        app.update(Message::MoveDown);
+        // Navigate to the PR → should clear from new_comment_pr_ids.
+        focus_pr(&mut app, &id);
         assert!(!app.new_comment_pr_ids.contains(&id));
     }
 
     #[test]
     fn comment_increase_without_updated_at_triggers_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         // updated_at は固定 (0秒)、コメント数 0
@@ -1329,11 +1400,7 @@ mod tests {
 
     #[test]
     fn comment_increase_on_mentioned_role_pr_no_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1359,11 +1426,7 @@ mod tests {
 
     #[test]
     fn added_mentioned_pr_triggers_mentioned_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         app.update(Message::PollResult(payload_from(IndexMap::new())));
         let id = make_id(1);
         let mut prs = IndexMap::new();
@@ -1375,11 +1438,7 @@ mod tests {
 
     #[test]
     fn disabled_mentioned_suppresses_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            events_except(NotifyEvent::Mentioned),
-        );
+        let mut app = test_app(events_except(NotifyEvent::Mentioned));
         app.update(Message::PollResult(payload_from(IndexMap::new())));
         let id = make_id(1);
         let mut prs = IndexMap::new();
@@ -1390,11 +1449,7 @@ mod tests {
 
     #[test]
     fn open_selected_mentioned_pr_queues_dismissal_and_removes_from_list() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id_mentioned = make_id(1);
         let id_author = make_id(2);
         let mut prs = IndexMap::new();
@@ -1407,45 +1462,42 @@ mod tests {
             make_pr_custom(&id_author, PrRole::Author, None, 0),
         );
         app.update(Message::PollResult(payload_from(prs)));
-        app.update(Message::MoveDown); // select index 0 (mentioned)
+        select_pr(&mut app, &id_mentioned);
 
         app.update(Message::OpenSelected);
 
         assert_eq!(app.pending_dismissals, vec![id_mentioned.clone()]);
         assert!(!app.prs.contains_key(&id_mentioned));
-        // 選択は同じ行位置の残り PR に再解決される
-        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(
+            app.selected_row(),
+            Some(&VisibleRow::Role(PrRole::Mentioned))
+        );
         assert!(app.prs.contains_key(&id_author));
         assert!(app.dirty);
     }
 
     #[test]
     fn open_selected_last_mentioned_pr_clears_selection() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(id.clone(), make_pr_custom(&id, PrRole::Mentioned, None, 0));
         app.update(Message::PollResult(payload_from(prs)));
-        app.update(Message::MoveDown);
+        select_pr(&mut app, &id);
 
         app.update(Message::OpenSelected);
 
         assert_eq!(app.pending_dismissals, vec![id]);
         assert!(app.prs.is_empty());
-        assert_eq!(app.list_state.selected(), None);
+        assert_eq!(
+            app.selected_row(),
+            Some(&VisibleRow::Role(PrRole::Mentioned))
+        );
     }
 
     #[test]
     fn open_selected_non_mentioned_pr_does_not_queue_dismissal() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1453,7 +1505,7 @@ mod tests {
             make_pr_custom(&id, PrRole::ReviewRequested, None, 0),
         );
         app.update(Message::PollResult(payload_from(prs)));
-        app.update(Message::MoveDown);
+        select_pr(&mut app, &id);
 
         app.update(Message::OpenSelected);
 
@@ -1463,11 +1515,7 @@ mod tests {
 
     #[test]
     fn open_selected_clears_new_comment_pr_id() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1482,7 +1530,7 @@ mod tests {
             make_pr_with_comments(&id, PrRole::Author, None, 100, 2),
         );
         app.update(Message::PollResult(payload_from(prs2)));
-        app.update(Message::MoveDown); // select the PR
+        select_pr(&mut app, &id);
         // re-add flag manually to simulate state
         app.new_comment_pr_ids.insert(id.clone());
         app.dirty = false;
@@ -1497,11 +1545,7 @@ mod tests {
 
     #[test]
     fn new_comment_pr_ids_pruned_when_pr_removed_from_list() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1527,11 +1571,7 @@ mod tests {
 
     #[test]
     fn self_comment_does_not_trigger_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
 
         // First poll: baseline
@@ -1557,11 +1597,7 @@ mod tests {
 
     #[test]
     fn other_comment_triggers_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
 
         // First poll: baseline
@@ -1585,11 +1621,7 @@ mod tests {
 
     #[test]
     fn last_commenter_none_triggers_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
 
         // First poll: baseline
@@ -1626,11 +1658,7 @@ mod tests {
 
     #[test]
     fn disabled_review_requested_suppresses_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            events_except(NotifyEvent::ReviewRequested),
-        );
+        let mut app = test_app(events_except(NotifyEvent::ReviewRequested));
         app.update(Message::PollResult(payload_from(IndexMap::new())));
         let id = make_id(1);
         let mut prs = IndexMap::new();
@@ -1644,11 +1672,7 @@ mod tests {
 
     #[test]
     fn disabled_pr_closed_suppresses_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            events_except(NotifyEvent::PrClosed),
-        );
+        let mut app = test_app(events_except(NotifyEvent::PrClosed));
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(id.clone(), make_pr_custom(&id, PrRole::Author, None, 0));
@@ -1663,11 +1687,7 @@ mod tests {
 
     #[test]
     fn disabled_pr_merged_suppresses_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            events_except(NotifyEvent::PrMerged),
-        );
+        let mut app = test_app(events_except(NotifyEvent::PrMerged));
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(id.clone(), make_pr_custom(&id, PrRole::Author, None, 0));
@@ -1682,11 +1702,7 @@ mod tests {
 
     #[test]
     fn disabled_pr_merged_still_allows_pr_closed() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            events_except(NotifyEvent::PrMerged),
-        );
+        let mut app = test_app(events_except(NotifyEvent::PrMerged));
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(id.clone(), make_pr_custom(&id, PrRole::Author, None, 0));
@@ -1702,11 +1718,7 @@ mod tests {
 
     #[test]
     fn disabled_re_review_requested_suppresses_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            events_except(NotifyEvent::ReReviewRequested),
-        );
+        let mut app = test_app(events_except(NotifyEvent::ReReviewRequested));
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1737,11 +1749,7 @@ mod tests {
 
     #[test]
     fn disabled_new_comment_suppresses_notification_but_keeps_highlight() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            events_except(NotifyEvent::NewComment),
-        );
+        let mut app = test_app(events_except(NotifyEvent::NewComment));
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1769,11 +1777,7 @@ mod tests {
 
     #[test]
     fn empty_events_suppresses_all_notifications() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            HashSet::new(),
-        );
+        let mut app = test_app(HashSet::new());
         // review requested
         app.update(Message::PollResult(payload_from(IndexMap::new())));
         let id = make_id(1);
@@ -1802,11 +1806,7 @@ mod tests {
 
     #[test]
     fn ci_pending_to_success_triggers_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1828,11 +1828,7 @@ mod tests {
 
     #[test]
     fn ci_pending_to_failure_triggers_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1854,11 +1850,7 @@ mod tests {
 
     #[test]
     fn ci_success_to_success_no_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1879,11 +1871,7 @@ mod tests {
 
     #[test]
     fn ci_none_to_success_no_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(id.clone(), make_pr_with_ci(&id, PrRole::Author, 0, None));
@@ -1904,11 +1892,7 @@ mod tests {
 
     #[test]
     fn ci_notification_only_for_author() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1932,11 +1916,7 @@ mod tests {
 
     #[test]
     fn ci_notification_not_for_mentioned_role() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1960,11 +1940,7 @@ mod tests {
 
     #[test]
     fn disabled_ci_finished_suppresses_notification() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            events_except(NotifyEvent::CiFinished),
-        );
+        let mut app = test_app(events_except(NotifyEvent::CiFinished));
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(
@@ -1985,11 +1961,7 @@ mod tests {
 
     #[test]
     fn ci_no_notification_on_first_poll() {
-        let mut app = App::new(
-            "testuser".to_string(),
-            ColorScheme::default(),
-            NotifyEvent::all(),
-        );
+        let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(

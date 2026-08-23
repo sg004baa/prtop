@@ -13,7 +13,7 @@ impl std::fmt::Display for PrId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PrRole {
     Author,
     ReviewRequested,
