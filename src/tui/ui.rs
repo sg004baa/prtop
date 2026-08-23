@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, HighlightSpacing, List, ListItem, Paragraph};
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, LoadingState, Screen};
+use crate::app::{App, LoadingState, Screen, VisibleRow};
 use crate::types::{CiStatus, PrRole, PrState};
 
 pub fn view(f: &mut Frame, app: &mut App) {
@@ -16,24 +16,18 @@ pub fn view(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// Returns (role, status, ci, number, repo, title) column widths based on actual PR data lengths.
-/// Layout: [▸ ][role][  ][status][  ][ci][  ][number][title][  ][repo]
-fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize, usize, usize) {
-    let effective = (term_width as usize).saturating_sub(2); // 2 for "▸ " / "  "
-    let role: usize = 7; // "AUTHOR ", "REVIEW ", "MENTION"
+/// Returns (status, ci, number, repo, title) column widths based on actual PR data lengths.
+/// Child layout: [▸ ][  ][status][  ][ci][  ][number][title][  ][repo]
+fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize, usize) {
+    let effective = (term_width as usize).saturating_sub(4); // highlight + tree indent
     let status: usize = 6; // "OPEN  ", "CLOSED", "MERGED"
     let ci: usize = 3; // "✓  ", "×  ", "...", "-  "
     let number: usize = 7; // "#12345 "
-    let seps: usize = 8; // "  " after role/status/ci/title
-    let fixed = role + status + ci + seps + number;
+    let seps: usize = 6;
+    let fixed = status + ci + seps + number;
     let remaining = effective.saturating_sub(fixed);
 
-    let max_repo = app
-        .prs
-        .keys()
-        .map(|id| id.owner.len() + 1 + id.repo.len())
-        .max()
-        .unwrap_or(15);
+    let max_repo = app.prs.keys().map(|id| id.repo.width()).max().unwrap_or(15);
     let max_title = app
         .prs
         .values()
@@ -48,14 +42,14 @@ fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize, usize,
         let title = remaining.saturating_sub(repo);
         (repo, title)
     };
-    (role, status, ci, number, repo, title)
+    (status, ci, number, repo, title)
 }
 
 fn pr_list_area(f: &Frame, app: &App) -> Rect {
     // fixed rows: app_header(1) + col_header(1) + blank(1) + footer(1) = 4
     let max_list_lines = f.area().height.saturating_sub(4).max(1);
     let list_lines = match &app.loading {
-        LoadingState::Loaded => (app.prs.len().max(1) as u16).min(max_list_lines),
+        LoadingState::Loaded => (app.visible_rows.len().max(1) as u16).min(max_list_lines),
         _ => 1,
     };
     let height = (list_lines + 4).min(f.area().height);
@@ -116,16 +110,14 @@ fn render_col_header(
     f: &mut Frame,
     app: &App,
     area: Rect,
-    widths: (usize, usize, usize, usize, usize, usize),
+    widths: (usize, usize, usize, usize, usize),
 ) {
-    let (role_w, status_w, ci_w, num_w, repo_w, title_w) = widths;
+    let (status_w, ci_w, num_w, repo_w, title_w) = widths;
     let style = Style::default()
         .fg(app.colors.col_header)
         .add_modifier(Modifier::BOLD);
     let header = Line::from(vec![
-        Span::raw("  "), // indent to match list highlight symbol ("▸ " / "  ")
-        Span::styled(format!("{:<width$}", "ROLE", width = role_w), style),
-        Span::raw("  "),
+        Span::raw("    "), // list highlight symbol + PR tree indent
         Span::styled(format!("{:<width$}", "STATUS", width = status_w), style),
         Span::raw("  "),
         Span::styled(format!("{:<width$}", "CI", width = ci_w), style),
@@ -142,7 +134,7 @@ fn render_list(
     f: &mut Frame,
     app: &mut App,
     area: Rect,
-    widths: (usize, usize, usize, usize, usize, usize),
+    widths: (usize, usize, usize, usize, usize),
 ) {
     match &app.loading {
         LoadingState::Initial | LoadingState::Loading => {
@@ -159,73 +151,68 @@ fn render_list(
         LoadingState::Loaded => {}
     }
 
-    if app.prs.is_empty() {
-        let empty = Paragraph::new("  No PRs found").style(Style::default().fg(Color::DarkGray));
-        f.render_widget(empty, area);
-        return;
-    }
-
-    let (role_w, status_w, ci_w, num_w, repo_w, title_w) = widths;
-
+    let (status_w, ci_w, num_w, repo_w, title_w) = widths;
     let items: Vec<ListItem> = app
-        .prs
+        .visible_rows
         .iter()
-        .map(|(id, pr)| {
-            let is_new = app.new_pr_ids.contains(id);
-
-            let role_tag = match pr.role {
-                PrRole::Author => "AUTHOR",
-                PrRole::ReviewRequested => "REVIEW",
-                PrRole::Mentioned => "MENTION",
-            };
-
-            let (status_tag, status_style) = match pr.state {
-                PrState::Open => ("OPEN", Style::default().fg(Color::Green)),
-                PrState::Closed => ("CLOSED", Style::default().fg(Color::Yellow)),
-                PrState::Merged => ("MERGED", Style::default().fg(Color::Magenta)),
-            };
-
-            let repo_display = format!("{}/{}", id.owner, id.repo);
-            let number_display = format!("#{}", id.number);
-
-            let has_new_comment = app.new_comment_pr_ids.contains(id);
-            let title_style = if is_new {
-                Style::default().fg(app.colors.new_pr)
-            } else if has_new_comment {
-                Style::default().fg(app.colors.new_comment)
-            } else if pr.is_draft {
-                Style::default().fg(app.colors.draft)
-            } else {
-                Style::default()
-            };
-
-            let (ci_tag, ci_style) = ci_cell(pr.ci_status.as_ref());
-            let line = Line::from(vec![
-                Span::styled(
-                    format!("{:<width$}", role_tag, width = role_w),
-                    Style::default().fg(app.colors.role),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    format!("{:<width$}", status_tag, width = status_w),
-                    status_style,
-                ),
-                Span::raw("  "),
-                Span::styled(format!("{:<width$}", ci_tag, width = ci_w), ci_style),
-                Span::raw("  "),
-                Span::styled(
-                    format!("{:<width$}", number_display, width = num_w),
-                    Style::default().fg(app.colors.number),
-                ),
-                Span::styled(pad(&truncate(&pr.title, title_w), title_w), title_style),
-                Span::raw("  "),
-                Span::styled(
-                    pad(&truncate(&repo_display, repo_w), repo_w),
-                    Style::default().fg(app.colors.repo),
-                ),
-            ]);
-
-            ListItem::new(line)
+        .map(|row| match row {
+            VisibleRow::Role(role) => {
+                let marker = if app.role_is_collapsed(*role) {
+                    "▶"
+                } else {
+                    "▼"
+                };
+                ListItem::new(Line::from(vec![Span::styled(
+                    format!("{marker} {}", role_label(*role)),
+                    Style::default()
+                        .fg(app.colors.role)
+                        .add_modifier(Modifier::BOLD),
+                )]))
+            }
+            VisibleRow::Pr(id) => {
+                let pr = app
+                    .prs
+                    .get(id)
+                    .expect("visible PR row must reference cached PR");
+                let is_new = app.new_pr_ids.contains(id);
+                let (status_tag, status_style) = match pr.state {
+                    PrState::Open => ("OPEN", Style::default().fg(Color::Green)),
+                    PrState::Closed => ("CLOSED", Style::default().fg(Color::Yellow)),
+                    PrState::Merged => ("MERGED", Style::default().fg(Color::Magenta)),
+                };
+                let number_display = format!("#{}", id.number);
+                let has_new_comment = app.new_comment_pr_ids.contains(id);
+                let title_style = if is_new {
+                    Style::default().fg(app.colors.new_pr)
+                } else if has_new_comment {
+                    Style::default().fg(app.colors.new_comment)
+                } else if pr.is_draft {
+                    Style::default().fg(app.colors.draft)
+                } else {
+                    Style::default()
+                };
+                let (ci_tag, ci_style) = ci_cell(pr.ci_status.as_ref());
+                ListItem::new(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{:<width$}", status_tag, width = status_w),
+                        status_style,
+                    ),
+                    Span::raw("  "),
+                    Span::styled(format!("{:<width$}", ci_tag, width = ci_w), ci_style),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{:<width$}", number_display, width = num_w),
+                        Style::default().fg(app.colors.number),
+                    ),
+                    Span::styled(pad(&truncate(&pr.title, title_w), title_w), title_style),
+                    Span::raw("  "),
+                    Span::styled(
+                        pad(&truncate(&id.repo, repo_w), repo_w),
+                        Style::default().fg(app.colors.repo),
+                    ),
+                ]))
+            }
         })
         .collect();
 
@@ -255,7 +242,10 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(app.colors.footer_count),
         ),
         Span::raw(" │ "),
-        Span::styled("?: help", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "Enter: toggle/open  o: open  ?: help",
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::raw("  "),
         Span::styled(status, Style::default().fg(Color::Yellow)),
     ]);
@@ -275,7 +265,8 @@ fn render_help(f: &mut Frame, _app: &mut App) {
         Line::from("  q / Ctrl+C    Quit"),
         Line::from("  j / ↓         Move down"),
         Line::from("  k / ↑         Move up"),
-        Line::from("  Enter / o     Open PR in browser"),
+        Line::from("  Enter         Toggle role / open PR"),
+        Line::from("  o             Open selected PR in browser"),
         Line::from("  ?             Toggle help"),
         Line::from("  r             Force refresh"),
         Line::from(""),
@@ -287,6 +278,14 @@ fn render_help(f: &mut Frame, _app: &mut App) {
 
     let help = Paragraph::new(help_text).block(Block::default().title(" Help "));
     f.render_widget(help, f.area());
+}
+
+fn role_label(role: PrRole) -> &'static str {
+    match role {
+        PrRole::Author => "AUTHOR",
+        PrRole::ReviewRequested => "REVIEW",
+        PrRole::Mentioned => "MENTION",
+    }
 }
 
 fn ci_cell(ci: Option<&CiStatus>) -> (&'static str, Style) {

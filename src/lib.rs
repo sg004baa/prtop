@@ -9,3 +9,4 @@ pub mod notify;
 pub mod poller;
 pub mod tui;
 pub mod types;
+pub mod ui_state;

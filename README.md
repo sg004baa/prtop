@@ -9,7 +9,7 @@ A terminal-resident TUI that monitors GitHub pull requests you're involved in as
 - Lists PRs where you are the author, a requested reviewer, or mentioned, with status (Open/Closed/Merged)
 - Auto-refreshes on a configurable interval
 - Terminal notifications on key events (merged, review requested, re-review requested, mentioned)
-- Keyboard navigation with browser open on Enter
+- Role-grouped keyboard navigation; Enter toggles groups or opens a PR
 - Mentioned PRs disappear once opened and come back only when you are mentioned again
 - Compact inline display — fits alongside other terminal panes
 
@@ -99,6 +99,12 @@ shows `-` for every PR.
 transitions from in-progress to success/failure. It defaults off because CI
 flapping can be noisy.
 
+## Role Groups
+
+PRs are grouped as `AUTHOR`, `REVIEW`, and `MENTION`. Within each group,
+repositories and PR numbers are sorted descending. Enter toggles a group, and
+the collapsed state is persisted in `<config_dir>/prtop/ui-state.json`.
+
 ## Mentions
 
 PRs where you are mentioned (GitHub search `mentions:{username}`) show up with the
@@ -117,7 +123,7 @@ app_title    = "cyan"         # "GitHub PR Live" in header
 col_header   = "dark_gray"    # column header row
 role         = "cyan"         # AUTHOR / REVIEW / MENTION
 number       = "yellow"       # #1234
-repo         = "blue"         # org/repo
+repo         = "blue"         # repository name
 new_pr       = "green"        # newly appeared PRs
 new_comment  = "light_yellow" # PRs with new comments
 draft        = "dark_gray"    # draft PRs
@@ -129,11 +135,12 @@ Accepted values: `#rrggbb` hex, or named colors (`black`, `red`, `cyan`, `dark_g
 
 ## Keybindings
 
-| Key            | Action             |
-| -------------- | ------------------ |
-| `j` / `↓`      | Move down          |
-| `k` / `↑`      | Move up            |
-| `Enter` / `o`  | Open PR in browser |
-| `r`            | Force refresh      |
-| `?`            | Toggle help        |
-| `q` / `Ctrl+C` | Quit               |
+| Key            | Action                              |
+| -------------- | ----------------------------------- |
+| `j` / `↓`      | Move down                           |
+| `k` / `↑`      | Move up                             |
+| `Enter`        | Toggle selected role / open PR      |
+| `o`            | Open selected PR in browser         |
+| `r`            | Force refresh                       |
+| `?`            | Toggle help                         |
+| `q` / `Ctrl+C` | Quit                                |
