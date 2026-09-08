@@ -38,24 +38,35 @@ prt
 Create `~/.config/prtop/config.toml`:
 
 ```toml
-github_token = "ghp_xxx"
+github_tokens = ["ghp_xxx", "github_pat_yyy"]
 username = "github-username"
 poll_interval_secs = 60  # optional, default: 60
 ```
 
 See `config.example.toml` for a full example.
 
-Authentication can also be provided via CLI flags or environment variables
+Fine-grained GitHub PATs are limited to one resource owner. Configure one
+token per organization or other resource owner whose PRs you want to monitor.
+PRs visible through multiple tokens are deduplicated and merged into one entry.
+If a token fails, its most recent successful PR set is retained while the
+other tokens continue updating. Each failed token emits an error identified as
+`GitHub token #N`, rather than an organization name.
 
-| Setting      | Flag             | Env var                 |
-| ------------ | ---------------- | ----------------------- |
-| GitHub token | `--github-token` | `PRTOP_GITHUB_TOKEN`    |
-| Username     | `--username`     | `PRTOP_GITHUB_USERNAME` |
+Authentication is configured with the `github_tokens` array above. The username
+can also be supplied via CLI or environment variable:
+
+| Setting  | Flag          | Env var                 |
+| -------- | ------------- | ----------------------- |
+| Username | `--username`  | `PRTOP_GITHUB_USERNAME` |
 
 > [!CAUTION]
-> Grant **read-only** permissions only. prtop never writes to GitHub
+> Grant **read-only** permissions to every token. prtop never writes to GitHub.
 
-Required scopes (fine-grained token): **Pull requests: Read-only**, **Metadata: Read-only**
+Every token needs these fine-grained permissions: **Pull requests: Read-only**
+and **Metadata: Read-only**. To populate CI status for PRs visible through a
+token, that same token also needs **Commit statuses: Read-only** and/or
+**Checks: Read-only**; without those permissions, CI calls silently return
+403/404 and the `CI` column shows `-` for those PRs.
 
 ## Notifications
 
@@ -90,10 +101,9 @@ enabled = true
 
 CI status is fetched every poll (per-PR REST calls to
 `/repos/{owner}/{repo}/commits/{sha}/status` and `/check-runs`) and shown in
-the `CI` column regardless of `ci_finished`. The token needs
-**Commit statuses: Read-only** and/or **Checks: Read-only** in addition to
-the base scopes; without them the calls 403/404 silently and the `CI` column
-shows `-` for every PR.
+the `CI` column regardless of `ci_finished`. Each token needs the additional
+**Commit statuses: Read-only** and/or **Checks: Read-only** permissions;
+without them the calls return 403/404 silently and affected PRs show `-`.
 
 `ci_finished` controls only whether a *notification* fires when CI
 transitions from in-progress to success/failure. It defaults off because CI

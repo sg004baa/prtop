@@ -1,7 +1,14 @@
 # ~/.config/prtop/config.toml
-github_token = "ghp_xxx"
+github_tokens = ["ghp_xxx", "github_pat_yyy"]
 username = "myuser"
 poll_interval_secs = 60
+
+# Fine-grained GitHub PATs are limited to one resource owner. Add one token
+# per organization or other resource owner whose PRs you want to monitor.
+# PRs visible through multiple tokens are merged into one entry. If a token
+# fails, its most recent successful PR set is retained while other tokens
+# continue updating. Each failed token emits an error identified as
+# "GitHub token #N", rather than an organization name.
 
 # Notifications (via OSC 9 — requires terminal support, e.g. WezTerm)
 #
@@ -19,9 +26,9 @@ poll_interval_secs = 60
 #   ❌ ci_finished         — CI transitions from in-progress to success/failure
 #
 # `ci_finished` controls only whether a notification fires on CI transitions;
-# the CI column itself is always populated. Token needs
+# the CI column itself is always populated. Every token needs
 # `Commit statuses: Read-only` and/or `Checks: Read-only` to read CI state —
-# without them the column silently shows `-` for every PR.
+# without them the column silently shows `-` for PRs visible through that token.
 # Mentioned PRs are hidden once opened in the browser (persisted in
 # <cache_dir>/prtop/dismissed.json, e.g. ~/.cache/prtop/dismissed.json) and
 # come back only when someone mentions you again on them.

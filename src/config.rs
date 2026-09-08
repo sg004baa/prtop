@@ -53,9 +53,6 @@ impl NotifyEvent {
 #[derive(Parser, Debug)]
 #[command(name = "prt", version, about = "GitHub PR Live Viewer")]
 struct Cli {
-    #[arg(long, env = "PRTOP_GITHUB_TOKEN")]
-    github_token: Option<String>,
-
     #[arg(long, env = "PRTOP_GITHUB_USERNAME")]
     username: Option<String>,
 
@@ -90,7 +87,7 @@ struct ColorsFileConfig {
 
 #[derive(Debug, Deserialize, Default)]
 struct FileConfig {
-    github_token: Option<String>,
+    github_tokens: Option<Vec<String>>,
     username: Option<String>,
     poll_interval_secs: Option<u64>,
     notify: Option<NotifyFileConfig>,
@@ -99,7 +96,7 @@ struct FileConfig {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub github_token: String,
+    pub github_tokens: Vec<String>,
     pub username: String,
     pub poll_interval_secs: u64,
     pub notify_enabled: bool,
@@ -137,6 +134,28 @@ fn resolve_notify_events(notify: &NotifyFileConfig) -> HashSet<NotifyEvent> {
     events
 }
 
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    #[test]
+    fn token_list_requires_nonblank_token() {
+        assert!(validate_github_tokens(&["token".to_string()]).is_ok());
+        assert!(validate_github_tokens(&[]).is_err());
+        assert!(validate_github_tokens(&["  ".to_string()]).is_err());
+    }
+
+    #[test]
+    fn toml_deserializes_multiple_tokens() {
+        let parsed: FileConfig =
+            toml::from_str(r#"github_tokens = ["token-a", "token-b"]"#).unwrap();
+        assert_eq!(
+            parsed.github_tokens.unwrap(),
+            ["token-a".to_string(), "token-b".to_string()]
+        );
+    }
+}
+
 fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("prtop").join("config.toml"))
 }
@@ -151,19 +170,32 @@ fn load_file_config() -> FileConfig {
     toml::from_str(&content).unwrap_or_default()
 }
 
+fn validate_github_tokens(tokens: &[String]) -> Result<(), AppError> {
+    if tokens.is_empty() {
+        return Err(AppError::Config(
+            "github_tokens must contain at least one token.".to_string(),
+        ));
+    }
+    if tokens.iter().any(|token| token.trim().is_empty()) {
+        return Err(AppError::Config(
+            "github_tokens must not contain blank tokens.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn load() -> Result<Self, AppError> {
         let cli = Cli::parse();
         let file = load_file_config();
 
-        let github_token = cli
-            .github_token
-            .or(file.github_token)
-            .ok_or_else(|| {
-                AppError::Config(
-                    "GitHub token not found. Set via --github-token, PRTOP_GITHUB_TOKEN env, or config file.".to_string(),
-                )
-            })?;
+        let github_tokens = file.github_tokens.ok_or_else(|| {
+            AppError::Config(
+                "GitHub tokens not found. Set github_tokens = [\"...\"] in config file."
+                    .to_string(),
+            )
+        })?;
+        validate_github_tokens(&github_tokens)?;
 
         let username = cli
             .username
@@ -220,7 +252,7 @@ impl Config {
         };
 
         Ok(Config {
-            github_token,
+            github_tokens,
             username,
             poll_interval_secs,
             notify_enabled,

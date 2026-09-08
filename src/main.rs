@@ -61,7 +61,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Spawn poller
-    let client = GitHubClient::new(config.github_token.clone());
+    let clients = config
+        .github_tokens
+        .iter()
+        .cloned()
+        .map(GitHubClient::new)
+        .collect();
     let poll_cancel = cancel.clone();
     let poll_tx = msg_tx.clone();
     let error_tx = msg_tx.clone();
@@ -95,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         poller::polling_loop(
             poller::PollerContext {
-                client,
+                clients,
                 username,
                 interval,
                 dismiss_store: poll_dismiss_store,
