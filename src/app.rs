@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
@@ -9,7 +9,7 @@ use crate::colors::ColorScheme;
 use crate::config::NotifyEvent;
 use crate::diff::diff_pr_sets;
 use crate::notify::Notification;
-use crate::poller::PollPayload;
+use crate::poller::{CiPayload, CiUpdate, PollPayload};
 use crate::types::{CiStatus, PrId, PrRole, PrState, PullRequest, ReviewDecision};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -44,6 +44,7 @@ pub enum Message {
     Refresh,
     Deselect,
     PollResult(PollPayload),
+    CiResult(CiPayload),
     PollError(String),
 }
 
@@ -65,7 +66,9 @@ pub struct App {
     pub dirty: bool,
     pub last_activity: Option<Instant>,
     pub pending_notifications: Vec<Notification>,
-    /// ブラウザで開いて既読扱いになった Mentioned PR。main ループが drain して
+    /// Latest accepted snapshot generation. CI payloads from older snapshots are ignored.
+    pub snapshot_generation: u64,
+    pub snapshot_head_shas: HashMap<PrId, String>,
     /// DismissStore へ永続化する(pending_notifications と同じ drain パターン)。
     pub pending_dismissals: Vec<PrId>,
     pub notify_events: HashSet<NotifyEvent>,
@@ -98,6 +101,8 @@ impl App {
             dirty: true,
             last_activity: None,
             pending_notifications: Vec::new(),
+            snapshot_generation: 0,
+            snapshot_head_shas: HashMap::new(),
             pending_dismissals: Vec::new(),
             notify_events,
             colors,
@@ -111,7 +116,7 @@ impl App {
         // Help 画面中はバックグラウンドのポール以外の全入力でhelpを閉じる
         if self.screen == Screen::Help {
             match &msg {
-                Message::PollResult(_) | Message::PollError(_) => {}
+                Message::PollResult(_) | Message::CiResult(_) | Message::PollError(_) => {}
                 Message::Quit => {
                     self.should_quit = true;
                     self.dirty = true;
@@ -188,8 +193,9 @@ impl App {
                 if self.list_state.selected().is_some() {
                     let prev_id = self.selected_id();
                     self.list_state.select(None);
-                    if let Some(prev_id) = prev_id {
-                        self.dismiss_if_done(&prev_id);
+                    if let Some(prev_id) = prev_id
+                        && self.dismiss_if_done(&prev_id)
+                    {
                         self.rebuild_visible_rows(None);
                     }
                     self.dirty = true;
@@ -198,22 +204,37 @@ impl App {
             Message::PollResult(payload) => {
                 // Dismissed (closed/merged) PRs should not re-enter the list from the poller.
                 let mut incoming = payload.prs;
-                for id in &self.dismissed_ids {
-                    incoming.shift_remove(id);
+                let head_shas = payload.head_shas;
+                if payload.generation < self.snapshot_generation {
+                    return;
                 }
+                self.snapshot_generation = payload.generation;
+                for (id, pr) in &mut incoming {
+                    if pr.ci_status.is_none()
+                        && head_shas.get(id).is_some_and(|sha| !sha.is_empty())
+                        && self.snapshot_head_shas.get(id) == head_shas.get(id)
+                    {
+                        pr.ci_status = self.prs.get(id).and_then(|old| old.ci_status.clone());
+                    }
+                }
+                self.snapshot_head_shas = head_shas;
 
                 let already_loaded = matches!(self.loading, LoadingState::Loaded);
 
                 if !already_loaded {
                     // Initial load: show only open PRs.
-                    incoming.retain(|_, pr| pr.state == PrState::Open);
+                    incoming.retain(|id, pr| {
+                        !self.dismissed_ids.contains(id) && pr.state == PrState::Open
+                    });
                 } else {
                     // Subsequent polls: accept already-tracked PRs (they may have transitioned
                     // from open to closed/merged) and new open PRs only.
                     // This prevents closed/merged PRs that were never seen as open this session
                     // from appearing in the list.
-                    incoming
-                        .retain(|id, pr| self.prs.contains_key(id) || pr.state == PrState::Open);
+                    incoming.retain(|id, pr| {
+                        !self.dismissed_ids.contains(id)
+                            && (self.prs.contains_key(id) || pr.state == PrState::Open)
+                    });
                 }
 
                 let diff = diff_pr_sets(&self.prs, &incoming);
@@ -299,28 +320,6 @@ impl App {
                             self.new_comment_pr_ids.insert(id.clone());
                         }
                     }
-
-                    // CI status change: notify author when CI transitions from in-progress to finished
-                    for (id, new_pr) in &incoming {
-                        if let Some(old_pr) = self.prs.get(id)
-                            && new_pr.role == PrRole::Author
-                            && old_pr
-                                .ci_status
-                                .as_ref()
-                                .is_some_and(CiStatus::is_in_progress)
-                            && new_pr.ci_status.as_ref().is_some_and(CiStatus::is_finished)
-                            && self.notify_events.contains(&NotifyEvent::CiFinished)
-                        {
-                            let title = match new_pr.ci_status {
-                                Some(CiStatus::Success) => "CI passed",
-                                _ => "CI failed",
-                            };
-                            self.pending_notifications.push(Notification {
-                                title: title.to_string(),
-                                body: format!("{} ({})", new_pr.title, id),
-                            });
-                        }
-                    }
                 }
 
                 if already_loaded {
@@ -335,6 +334,8 @@ impl App {
                 let selected = self.selected_row().cloned();
                 self.prs = incoming;
                 sort_prs(&mut self.prs);
+                self.snapshot_head_shas
+                    .retain(|id, _| self.prs.contains_key(id));
                 self.rebuild_visible_rows(selected);
                 self.last_poll = Some(payload.polled_at);
                 self.poll_error = None;
@@ -344,6 +345,47 @@ impl App {
                     self.loading = LoadingState::Loaded;
                 }
                 self.dirty = true;
+            }
+            Message::CiResult(payload) => {
+                if payload.generation != self.snapshot_generation {
+                    return;
+                }
+                let updates: HashMap<PrId, CiUpdate> = payload.statuses;
+                let mut changed = false;
+                for (id, update) in updates {
+                    if self.snapshot_head_shas.get(&id).map(String::as_str)
+                        != Some(update.head_sha.as_str())
+                    {
+                        continue;
+                    }
+                    let status = update.status;
+                    let Some(pr) = self.prs.get_mut(&id) else {
+                        continue;
+                    };
+                    let old = pr.ci_status.clone();
+                    if old == status {
+                        continue;
+                    }
+                    if pr.role == PrRole::Author
+                        && old.as_ref().is_some_and(CiStatus::is_in_progress)
+                        && status.as_ref().is_some_and(CiStatus::is_finished)
+                        && self.notify_events.contains(&NotifyEvent::CiFinished)
+                    {
+                        let title = match status {
+                            Some(CiStatus::Success) => "CI passed",
+                            _ => "CI failed",
+                        };
+                        self.pending_notifications.push(Notification {
+                            title: title.to_string(),
+                            body: format!("{} ({})", pr.title, id),
+                        });
+                    }
+                    pr.ci_status = status;
+                    changed = true;
+                }
+                if changed {
+                    self.dirty = true;
+                }
             }
             Message::PollError(msg) => {
                 self.poll_error = Some(msg.clone());
@@ -440,21 +482,27 @@ impl App {
             _ => None,
         };
 
-        if prev_id.as_ref() != target_id.as_ref()
-            && let Some(prev_id) = prev_id.as_ref()
-        {
-            self.dismiss_if_done(prev_id);
-        }
+        let removed = if prev_id.as_ref() != target_id.as_ref() {
+            prev_id
+                .as_ref()
+                .is_some_and(|prev_id| self.dismiss_if_done(prev_id))
+        } else {
+            false
+        };
 
         if let Some(target_id) = target_id {
             self.new_pr_ids.remove(&target_id);
             self.new_comment_pr_ids.remove(&target_id);
         }
-        self.rebuild_visible_rows(target);
+        if removed {
+            self.rebuild_visible_rows(target);
+        } else {
+            self.list_state.select(Some(target_idx));
+        }
     }
 
     /// `id` の PR が closed/merged ならリストから削除し、再ポーリングで再登場しないよう dismiss 集合に積む。
-    fn dismiss_if_done(&mut self, id: &PrId) {
+    fn dismiss_if_done(&mut self, id: &PrId) -> bool {
         let is_done = self
             .prs
             .get(id)
@@ -463,6 +511,7 @@ impl App {
             self.dismissed_ids.insert(id.clone());
             self.prs.shift_remove(id);
         }
+        is_done
     }
 
     #[allow(dead_code)]
@@ -560,7 +609,9 @@ mod tests {
 
     fn payload_from(prs: IndexMap<PrId, PullRequest>) -> PollPayload {
         PollPayload {
+            generation: 0,
             prs,
+            head_shas: HashMap::new(),
             polled_at: Utc::now(),
         }
     }
@@ -574,6 +625,7 @@ mod tests {
         }
         payload_from(prs)
     }
+
     fn test_app(notify_events: HashSet<NotifyEvent>) -> App {
         App::new(
             "testuser".to_string(),
@@ -582,7 +634,6 @@ mod tests {
             HashSet::new(),
         )
     }
-
     fn select_row(app: &mut App, row: VisibleRow) {
         let index = app
             .visible_rows
@@ -1804,6 +1855,124 @@ mod tests {
         }
     }
 
+    fn ci_snapshot(prs: IndexMap<PrId, PullRequest>) -> PollPayload {
+        let head_shas = prs
+            .keys()
+            .map(|id| (id.clone(), "sha-1".to_string()))
+            .collect();
+        PollPayload {
+            generation: 1,
+            prs,
+            head_shas,
+            polled_at: Utc::now(),
+        }
+    }
+
+    fn ci_result(id: &PrId, status: Option<CiStatus>) -> Message {
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            id.clone(),
+            CiUpdate {
+                head_sha: "sha-1".to_string(),
+                status,
+            },
+        );
+        Message::CiResult(CiPayload {
+            generation: 1,
+            statuses,
+        })
+    }
+    #[test]
+    fn refresh_preserves_ci_only_for_the_same_head() {
+        let mut app = test_app(NotifyEvent::all());
+        let id = make_id(1);
+        let prs = IndexMap::from([(id.clone(), make_pr_with_ci(&id, PrRole::Author, 0, None))]);
+        app.update(Message::PollResult(ci_snapshot(prs.clone())));
+        app.update(ci_result(&id, Some(CiStatus::Pending)));
+
+        let mut refreshed = ci_snapshot(prs.clone());
+        refreshed.generation = 2;
+        app.update(Message::PollResult(refreshed));
+        assert_eq!(app.prs[&id].ci_status, Some(CiStatus::Pending));
+        app.update(ci_result_with(&id, 2, "sha-1", Some(CiStatus::Success)));
+        assert_eq!(app.prs[&id].ci_status, Some(CiStatus::Success));
+        assert_eq!(app.pending_notifications.len(), 1);
+
+        let mut new_head = ci_snapshot(prs);
+        new_head.generation = 3;
+        new_head.head_shas.insert(id.clone(), "sha-2".into());
+        app.update(Message::PollResult(new_head));
+        assert_eq!(app.prs[&id].ci_status, None);
+        app.update(ci_result_with(&id, 2, "sha-1", Some(CiStatus::Failure)));
+        assert_eq!(app.prs[&id].ci_status, None);
+    }
+
+    fn ci_result_with(
+        id: &PrId,
+        generation: u64,
+        head_sha: &str,
+        status: Option<CiStatus>,
+    ) -> Message {
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            id.clone(),
+            CiUpdate {
+                head_sha: head_sha.to_string(),
+                status,
+            },
+        );
+        Message::CiResult(CiPayload {
+            generation,
+            statuses,
+        })
+    }
+
+    #[test]
+    fn stale_or_mismatched_ci_cannot_update_current_or_removed_pr() {
+        let mut app = test_app(NotifyEvent::all());
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(id.clone(), make_pr_with_ci(&id, PrRole::Author, 0, None));
+
+        app.update(Message::PollResult(ci_snapshot(prs)));
+        app.update(ci_result_with(&id, 0, "sha-1", Some(CiStatus::Success)));
+        assert_eq!(app.prs[&id].ci_status, None);
+
+        app.update(ci_result_with(&id, 1, "sha-2", Some(CiStatus::Failure)));
+        assert_eq!(app.prs[&id].ci_status, None);
+
+        let removed = PollPayload {
+            generation: 2,
+            prs: IndexMap::new(),
+            head_shas: HashMap::new(),
+            polled_at: Utc::now(),
+        };
+        app.update(Message::PollResult(removed));
+        assert!(!app.prs.contains_key(&id));
+
+        app.update(ci_result_with(&id, 2, "sha-1", Some(CiStatus::Success)));
+        assert!(!app.prs.contains_key(&id));
+        assert!(app.pending_notifications.is_empty());
+    }
+
+    #[test]
+    fn duplicate_finished_ci_result_queues_one_author_notification() {
+        let mut app = test_app(NotifyEvent::all());
+        let id = make_id(1);
+        let mut prs = IndexMap::new();
+        prs.insert(
+            id.clone(),
+            make_pr_with_ci(&id, PrRole::Author, 0, Some(CiStatus::Pending)),
+        );
+
+        app.update(Message::PollResult(ci_snapshot(prs)));
+        app.update(ci_result(&id, Some(CiStatus::Success)));
+        app.update(ci_result(&id, Some(CiStatus::Success)));
+
+        assert_eq!(app.pending_notifications.len(), 1);
+        assert_eq!(app.pending_notifications[0].title, "CI passed");
+    }
+
     #[test]
     fn ci_pending_to_success_triggers_notification() {
         let mut app = test_app(NotifyEvent::all());
@@ -1813,14 +1982,8 @@ mod tests {
             id.clone(),
             make_pr_with_ci(&id, PrRole::Author, 0, Some(CiStatus::Pending)),
         );
-        app.update(Message::PollResult(payload_from(prs)));
-
-        let mut prs2 = IndexMap::new();
-        prs2.insert(
-            id.clone(),
-            make_pr_with_ci(&id, PrRole::Author, 100, Some(CiStatus::Success)),
-        );
-        app.update(Message::PollResult(payload_from(prs2)));
+        app.update(Message::PollResult(ci_snapshot(prs)));
+        app.update(ci_result(&id, Some(CiStatus::Success)));
 
         assert_eq!(app.pending_notifications.len(), 1);
         assert_eq!(app.pending_notifications[0].title, "CI passed");
@@ -1835,14 +1998,8 @@ mod tests {
             id.clone(),
             make_pr_with_ci(&id, PrRole::Author, 0, Some(CiStatus::Pending)),
         );
-        app.update(Message::PollResult(payload_from(prs)));
-
-        let mut prs2 = IndexMap::new();
-        prs2.insert(
-            id.clone(),
-            make_pr_with_ci(&id, PrRole::Author, 100, Some(CiStatus::Failure)),
-        );
-        app.update(Message::PollResult(payload_from(prs2)));
+        app.update(Message::PollResult(ci_snapshot(prs)));
+        app.update(ci_result(&id, Some(CiStatus::Failure)));
 
         assert_eq!(app.pending_notifications.len(), 1);
         assert_eq!(app.pending_notifications[0].title, "CI failed");
@@ -1857,14 +2014,8 @@ mod tests {
             id.clone(),
             make_pr_with_ci(&id, PrRole::Author, 0, Some(CiStatus::Success)),
         );
-        app.update(Message::PollResult(payload_from(prs)));
-
-        let mut prs2 = IndexMap::new();
-        prs2.insert(
-            id.clone(),
-            make_pr_with_ci(&id, PrRole::Author, 100, Some(CiStatus::Success)),
-        );
-        app.update(Message::PollResult(payload_from(prs2)));
+        app.update(Message::PollResult(ci_snapshot(prs)));
+        app.update(ci_result(&id, Some(CiStatus::Success)));
 
         assert!(app.pending_notifications.is_empty());
     }
@@ -1875,14 +2026,8 @@ mod tests {
         let id = make_id(1);
         let mut prs = IndexMap::new();
         prs.insert(id.clone(), make_pr_with_ci(&id, PrRole::Author, 0, None));
-        app.update(Message::PollResult(payload_from(prs)));
-
-        let mut prs2 = IndexMap::new();
-        prs2.insert(
-            id.clone(),
-            make_pr_with_ci(&id, PrRole::Author, 100, Some(CiStatus::Success)),
-        );
-        app.update(Message::PollResult(payload_from(prs2)));
+        app.update(Message::PollResult(ci_snapshot(prs)));
+        app.update(ci_result(&id, Some(CiStatus::Success)));
 
         assert!(
             app.pending_notifications.is_empty(),
@@ -1899,14 +2044,8 @@ mod tests {
             id.clone(),
             make_pr_with_ci(&id, PrRole::ReviewRequested, 0, Some(CiStatus::Pending)),
         );
-        app.update(Message::PollResult(payload_from(prs)));
-
-        let mut prs2 = IndexMap::new();
-        prs2.insert(
-            id.clone(),
-            make_pr_with_ci(&id, PrRole::ReviewRequested, 100, Some(CiStatus::Success)),
-        );
-        app.update(Message::PollResult(payload_from(prs2)));
+        app.update(Message::PollResult(ci_snapshot(prs)));
+        app.update(ci_result(&id, Some(CiStatus::Success)));
 
         assert!(
             app.pending_notifications.is_empty(),
@@ -1923,14 +2062,8 @@ mod tests {
             id.clone(),
             make_pr_with_ci(&id, PrRole::Mentioned, 0, Some(CiStatus::Pending)),
         );
-        app.update(Message::PollResult(payload_from(prs)));
-
-        let mut prs2 = IndexMap::new();
-        prs2.insert(
-            id.clone(),
-            make_pr_with_ci(&id, PrRole::Mentioned, 100, Some(CiStatus::Failure)),
-        );
-        app.update(Message::PollResult(payload_from(prs2)));
+        app.update(Message::PollResult(ci_snapshot(prs)));
+        app.update(ci_result(&id, Some(CiStatus::Failure)));
 
         assert!(
             app.pending_notifications.is_empty(),
@@ -1947,14 +2080,8 @@ mod tests {
             id.clone(),
             make_pr_with_ci(&id, PrRole::Author, 0, Some(CiStatus::Pending)),
         );
-        app.update(Message::PollResult(payload_from(prs)));
-
-        let mut prs2 = IndexMap::new();
-        prs2.insert(
-            id.clone(),
-            make_pr_with_ci(&id, PrRole::Author, 100, Some(CiStatus::Success)),
-        );
-        app.update(Message::PollResult(payload_from(prs2)));
+        app.update(Message::PollResult(ci_snapshot(prs)));
+        app.update(ci_result(&id, Some(CiStatus::Success)));
 
         assert!(app.pending_notifications.is_empty());
     }
@@ -1968,7 +2095,7 @@ mod tests {
             id.clone(),
             make_pr_with_ci(&id, PrRole::Author, 0, Some(CiStatus::Success)),
         );
-        app.update(Message::PollResult(payload_from(prs)));
+        app.update(Message::PollResult(ci_snapshot(prs)));
 
         assert!(
             app.pending_notifications.is_empty(),

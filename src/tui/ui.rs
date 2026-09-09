@@ -152,9 +152,42 @@ fn render_list(
     }
 
     let (status_w, ci_w, num_w, repo_w, title_w) = widths;
+    let item_count = app.visible_rows.len();
+    if area.is_empty() {
+        return;
+    }
+    if item_count == 0 {
+        app.list_state.select(None);
+        return;
+    }
+
+    let selected = match app.list_state.selected() {
+        Some(index) if index >= item_count => {
+            app.list_state.select(Some(item_count - 1));
+            Some(item_count - 1)
+        }
+        selected => selected,
+    };
+    let height = area.height as usize;
+    let mut first = app.list_state.offset().min(item_count - 1);
+    if let Some(selected) = selected {
+        if selected < first {
+            first = selected;
+        } else if selected >= first.saturating_add(height) {
+            first = (selected + 1).saturating_sub(height);
+        }
+    }
+
+    app.list_state.select(selected);
+    *app.list_state.offset_mut() = first;
+    let mut local_state = ratatui::widgets::ListState::default();
+    local_state.select(selected.map(|index| index - first));
+
     let items: Vec<ListItem> = app
         .visible_rows
         .iter()
+        .skip(first)
+        .take(height)
         .map(|row| match row {
             VisibleRow::Role(role) => {
                 let marker = if app.role_is_collapsed(*role) {
@@ -222,7 +255,7 @@ fn render_list(
         .highlight_symbol("▸ ")
         .highlight_spacing(HighlightSpacing::Always);
 
-    f.render_stateful_widget(list, area, &mut app.list_state);
+    f.render_stateful_widget(list, area, &mut local_state);
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {

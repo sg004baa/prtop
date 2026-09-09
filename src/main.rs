@@ -61,7 +61,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Spawn poller
-    let client = GitHubClient::new(config.github_token.clone());
+    let clients = config
+        .github_tokens
+        .iter()
+        .cloned()
+        .map(GitHubClient::new)
+        .collect();
     let poll_cancel = cancel.clone();
     let poll_tx = msg_tx.clone();
     let error_tx = msg_tx.clone();
@@ -84,18 +89,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let poll_sender = {
             let tx = poll_tx;
-            let (payload_tx, mut payload_rx) = mpsc::channel::<poller::PollPayload>(64);
+            let (event_tx, mut event_rx) = mpsc::channel::<poller::PollEvent>(64);
             tokio::spawn(async move {
-                while let Some(payload) = payload_rx.recv().await {
-                    let _ = tx.send(Message::PollResult(payload)).await;
+                while let Some(event) = event_rx.recv().await {
+                    let msg = match event {
+                        poller::PollEvent::Snapshot(payload) => Message::PollResult(payload),
+                        poller::PollEvent::Ci(payload) => Message::CiResult(payload),
+                    };
+                    let _ = tx.send(msg).await;
                 }
             });
-            payload_tx
+            event_tx
         };
 
         poller::polling_loop(
             poller::PollerContext {
-                client,
+                clients,
                 username,
                 interval,
                 dismiss_store: poll_dismiss_store,
@@ -130,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 if is_refresh {
-                    let _ = refresh_tx.send(()).await;
+                    let _ = refresh_tx.try_send(());
                 }
                 for n in app.pending_notifications.drain(..) {
                     notifier.notify(&n);
