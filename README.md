@@ -105,6 +105,11 @@ the `CI` column regardless of `ci_finished`. Each token needs the additional
 **Commit statuses: Read-only** and/or **Checks: Read-only** permissions;
 without them the calls return 403/404 silently and affected PRs show `-`.
 
+On startup and refresh, the PR list appears before CI fetching completes. The
+CI column updates afterward without moving your selection. While refreshing,
+the previous CI status is kept only when the PR still has the same head commit;
+new or changed commits show `-` until their CI status arrives.
+
 `ci_finished` controls only whether a *notification* fires when CI
 transitions from in-progress to success/failure. It defaults off because CI
 flapping can be noisy.
