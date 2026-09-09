@@ -1052,6 +1052,10 @@ mod tests {
 
     #[tokio::test]
     async fn polling_loop_refresh_triggers_early_poll() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+
         let server = MockServer::start().await;
         let mut response = graphql_response_with_pr(1);
         response["data"]["search"]["nodes"][0]["headRefOid"] = "sha".into();
@@ -1059,15 +1063,47 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(response))
             .mount(&server)
             .await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gate_uri = format!("http://{}", listener.local_addr().unwrap());
+        let (gate_tx, mut gate_rx) = mpsc::channel::<oneshot::Sender<()>>(4);
+        let gate_handle =
+            tokio::spawn(async move {
+                let mut handlers = Vec::with_capacity(4);
+                for _ in 0..4 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let gate_tx = gate_tx.clone();
+                    handlers.push(tokio::spawn(async move {
+                    let mut reader = BufReader::new(stream);
+                    loop {
+                        let mut line = String::new();
+                        let bytes = reader.read_line(&mut line).await.unwrap();
+                        if bytes == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let (release_tx, release_rx) = oneshot::channel();
+                    gate_tx.send(release_tx).await.unwrap();
+                    release_rx.await.unwrap();
+                    let body =
+                        r#"{"state":"success","statuses":[{}],"total_count":0,"check_runs":[]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    reader.into_inner().write_all(response.as_bytes()).await.unwrap();
+                }));
+                }
+                for handler in handlers {
+                    handler.await.unwrap();
+                }
+            });
         Mock::given(method("GET"))
-            .and(wiremock::matchers::path_regex(r"^/repos/org/repo/commits/"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({
-                        "state": "success", "statuses": [{}], "total_count": 0, "check_runs": []
-                    }))
-                    .set_delay(Duration::from_secs(2)),
-            )
+            .and(wiremock::matchers::path_regex(
+                r"^/repos/org/repo/commits/[^/]+/(status|check-runs)$",
+            ))
+            .respond_with(ResponseTemplate::new(307).insert_header("Location", gate_uri))
             .mount(&server)
             .await;
 
@@ -1094,36 +1130,91 @@ mod tests {
             .await;
         });
 
-        let first = tokio::time::timeout(Duration::from_secs(1), recv_snapshot(&mut rx))
+        let expected_id = PrId {
+            owner: "org".to_string(),
+            repo: "repo".to_string(),
+            number: 1,
+        };
+        let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
-            .expect("timeout waiting for first poll");
-        let ci = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("timeout waiting for CI event")
+            .expect("timeout waiting for first snapshot")
             .expect("poll event channel closed");
-        match ci {
+        let first_generation = match first {
+            PollEvent::Snapshot(payload) => {
+                let pr = payload.prs.get(&expected_id).expect("expected PR missing");
+                assert_eq!(pr.ci_status, None);
+                payload.generation
+            }
+            PollEvent::Ci(_) => panic!("CI arrived before first snapshot"),
+        };
+
+        for _ in 0..2 {
+            let release = tokio::time::timeout(Duration::from_secs(10), gate_rx.recv())
+                .await
+                .expect("timeout waiting for first-cycle CI request")
+                .expect("gate channel closed");
+            release.send(()).unwrap();
+        }
+        let first_ci = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("timeout waiting for first CI event")
+            .expect("poll event channel closed");
+        match first_ci {
             PollEvent::Ci(payload) => {
-                assert_eq!(payload.generation, first.generation);
+                assert_eq!(payload.generation, first_generation);
                 assert_eq!(
-                    payload.statuses.values().next().unwrap().status,
+                    payload.statuses.get(&expected_id).unwrap().status,
                     Some(crate::types::CiStatus::Success)
                 );
             }
-            PollEvent::Snapshot(_) => panic!("snapshot arrived twice before CI"),
+            PollEvent::Snapshot(_) => panic!("CI event missing after first snapshot"),
         }
 
-        // Trigger refresh to force early second poll
         refresh_tx.send(()).await.unwrap();
-
-        // Wait for second poll triggered by refresh
-        tokio::time::timeout(Duration::from_secs(1), recv_snapshot(&mut rx))
+        let second = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
-            .expect("timeout waiting for refresh-triggered poll");
+            .expect("timeout waiting for refresh-triggered snapshot")
+            .expect("poll event channel closed");
+        let second_generation = match second {
+            PollEvent::Snapshot(payload) => {
+                let pr = payload.prs.get(&expected_id).expect("expected PR missing");
+                assert_eq!(pr.ci_status, None);
+                assert!(payload.generation > first_generation);
+                payload.generation
+            }
+            PollEvent::Ci(_) => panic!("CI arrived before refresh-triggered snapshot"),
+        };
+
+        for _ in 0..2 {
+            let release = tokio::time::timeout(Duration::from_secs(10), gate_rx.recv())
+                .await
+                .expect("timeout waiting for second-cycle CI request")
+                .expect("gate channel closed");
+            release.send(()).unwrap();
+        }
+        let second_ci = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("timeout waiting for second CI event")
+            .expect("poll event channel closed");
+        match second_ci {
+            PollEvent::Ci(payload) => {
+                assert_eq!(payload.generation, second_generation);
+                assert_eq!(
+                    payload.statuses.get(&expected_id).unwrap().status,
+                    Some(crate::types::CiStatus::Success)
+                );
+            }
+            PollEvent::Snapshot(_) => panic!("CI event missing after second snapshot"),
+        }
 
         cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(5), handle)
+        tokio::time::timeout(Duration::from_secs(10), handle)
             .await
-            .unwrap()
-            .unwrap();
+            .expect("timeout stopping polling loop")
+            .expect("polling loop task panicked");
+        tokio::time::timeout(Duration::from_secs(10), gate_handle)
+            .await
+            .expect("timeout stopping gate server")
+            .expect("gate server task panicked");
     }
 }
