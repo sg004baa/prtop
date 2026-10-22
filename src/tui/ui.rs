@@ -26,11 +26,7 @@ fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize, usize,
     let review = app
         .prs
         .keys()
-        .map(|id| {
-            review_cell(app.review_summaries.get(id), term_width < 100)
-                .0
-                .width()
-        })
+        .map(|id| review_display(app, id, term_width < 100).0.width())
         .max()
         .unwrap_or(6)
         .max(6);
@@ -238,8 +234,7 @@ fn render_list(
                     Style::default()
                 };
                 let (ci_tag, ci_style) = ci_cell(pr.ci_status.as_ref());
-                let (review_tag, review_style) =
-                    review_cell(app.review_summaries.get(id), area.width < 100);
+                let (review_tag, review_style) = review_display(app, id, area.width < 100);
                 ListItem::new(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(
@@ -336,6 +331,15 @@ fn role_label(role: PrRole) -> &'static str {
         PrRole::ReviewRequested => "REVIEW",
         PrRole::Mentioned => "MENTION",
     }
+}
+
+fn review_display(app: &App, id: &crate::types::PrId, compact: bool) -> (String, Style) {
+    let (mut text, mut style) = review_cell(app.review_summaries.get(id), compact);
+    if app.stale_reviews.contains(id) && app.review_summaries.contains_key(id) {
+        text.push_str(if compact { " ~" } else { " (stale)" });
+        style = Style::default().fg(Color::DarkGray);
+    }
+    (text, style)
 }
 
 fn review_cell(summary: Option<&crate::review::ReviewSummary>, compact: bool) -> (String, Style) {
@@ -516,7 +520,7 @@ mod tests {
             }));
             app.loading = LoadingState::Loaded;
             app.review_summaries.insert(
-                id,
+                id.clone(),
                 ReviewSummary {
                     approved: 1,
                     total: 2,
@@ -534,6 +538,11 @@ mod tests {
             assert!(row(1).contains("REVIEW"));
             assert!(row(3).contains(if width < 100 { "1/2" } else { "approved 1/2" }));
             assert!(row(3).contains("#1"));
+            app.stale_reviews.insert(id.clone());
+            let (label, style) = review_display(&app, &id, width < 100);
+            assert!(label.contains(if width < 100 { "~" } else { "(stale)" }));
+            assert_eq!(style.fg, Some(Color::DarkGray));
+            assert!(label.contains("1/2"));
         }
     }
 }

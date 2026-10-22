@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use serde_json::json;
 
-use super::client::{GitHubClient, ensure_graphql_http_success};
+use super::client::GitHubClient;
 use super::types::{ActorNode, GraphQlError, PageInfo};
 use crate::error::AppError;
 use crate::review::{ReviewSummary, SubmittedReview, summarize_reviews};
@@ -83,6 +83,7 @@ struct Reviewer {
     id: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct ReviewSnapshot {
     pub head_sha: String,
     pub open: bool,
@@ -123,7 +124,7 @@ impl GitHubClient {
         let mut version = None;
         // Bound pathological responses, but fail closed instead of using truncated data.
         for _ in 0..100 {
-            let response = self
+            let request = self
                 .client
                 .post(format!("{}/graphql", self.api_base))
                 .timeout(std::time::Duration::from_secs(30))
@@ -131,10 +132,11 @@ impl GitHubClient {
                 .json(&json!({"query": QUERY, "variables": {
                     "owner": id.owner, "repo": id.repo, "number": id.number,
                     "reviewsAfter": reviews_cursor, "requestsAfter": requests_cursor
-                }}))
-                .send()
-                .await?;
-            let response: Response = ensure_graphql_http_success(response).await?.json().await?;
+                }}));
+            let response: Response = self
+                .send_json(request, false)
+                .await?
+                .ok_or_else(|| invalid("missing response"))?;
             if let Some(errors) = response.errors
                 && !errors.is_empty()
             {

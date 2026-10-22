@@ -101,7 +101,7 @@ enabled = true
 | `pr_approved`         |    ✅    | All tracked reviewers approve your open, non-draft PR           |
 | `ci_finished`         |    ❌    | CI transitions from in-progress to success/failure (author only) |
 
-CI status is fetched every poll (per-PR REST calls to
+CI status is fetched for open PRs (per-PR REST calls to
 `/repos/{owner}/{repo}/commits/{sha}/status` and `/check-runs`) and shown in
 the `CI` column regardless of `ci_finished`. Each token needs the additional
 **Commit statuses: Read-only** and/or **Checks: Read-only** permissions;
@@ -135,11 +135,26 @@ or an unavailable/incomplete review fetch.
 - `0/0` never counts as approval. This is independent of GitHub's required
   approval count / `reviewDecision` and does not imply that the PR is mergeable.
 
-Reviews and review requests are fetched asynchronously on every poll, with
-pagination and the existing **Pull requests: Read-only** permission. Counts are
-published only after both connections are complete. Errors or changes detected
-while paging show `?`, never a partial approval count. The previous count may
-remain visible during refresh for the same head commit.
+Reviews and review requests are fetched asynchronously for open PRs, with
+pagination and the existing **Pull requests: Read-only** permission. Unchanged
+review summaries are cached for five minutes; a changed PR timestamp, review
+decision or head commit triggers an earlier check. Periodic rechecks also detect
+review changes that do not update the PR timestamp. Failed fetches retry no
+sooner than one minute later. Closed/merged search history is not enriched.
+
+Counts are published only after both connections are complete. A failed fetch
+keeps the previous count with `(stale)` (`~` on narrow terminals), in gray; `?`
+is used only when no complete count is available. Stale counts cannot generate
+approval notifications. A new head commit also marks the old count stale until
+its review fetch succeeds.
+
+Search, review, mention and CI requests share a per-token request gate. Requests
+are serialized per token, and HTTP 429/403 or GraphQL rate-limit errors stop
+queued requests until Retry-After / rate-limit reset (or a 60-second fallback).
+Failed authentication disables that token. Review/CI errors identify the token
+number and PR without displaying token values. Completed CI results are rechecked
+every five minutes; pending/unavailable CI is checked at most once per minute,
+with head changes bypassing the cache.
 
 `pr_approved` sends `PR approved` only when a previously observed incomplete
 review state becomes fully approved on your open, non-draft PR. The first

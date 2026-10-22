@@ -69,6 +69,7 @@ pub struct App {
     pub pending_notifications: Vec<Notification>,
     /// Latest accepted snapshot generation. CI payloads from older snapshots are ignored.
     pub snapshot_generation: u64,
+    pub stale_reviews: HashSet<PrId>,
     pub review_summaries: HashMap<PrId, crate::review::ReviewSummary>,
     // Last complete observation survives fetch failures, preventing duplicate notifications.
     review_approved: HashMap<PrId, bool>,
@@ -107,6 +108,7 @@ impl App {
             pending_notifications: Vec::new(),
             snapshot_generation: 0,
             review_summaries: HashMap::new(),
+            stale_reviews: HashSet::new(),
             review_approved: HashMap::new(),
             snapshot_head_shas: HashMap::new(),
             pending_dismissals: Vec::new(),
@@ -226,10 +228,12 @@ impl App {
                         pr.ci_status = self.prs.get(id).and_then(|old| old.ci_status.clone());
                     }
                 }
-                self.review_summaries.retain(|id, _| {
-                    incoming.contains_key(id)
-                        && self.snapshot_head_shas.get(id) == head_shas.get(id)
-                });
+                for id in self.review_summaries.keys() {
+                    if self.snapshot_head_shas.get(id) != head_shas.get(id) {
+                        self.stale_reviews.insert(id.clone());
+                    }
+                }
+                self.stale_reviews.retain(|id| incoming.contains_key(id));
                 self.snapshot_head_shas = head_shas;
 
                 let already_loaded = matches!(self.loading, LoadingState::Loaded);
@@ -374,9 +378,10 @@ impl App {
                     let Some(snapshot) =
                         snapshot.filter(|s| self.snapshot_head_shas.get(&id) == Some(&s.head_sha))
                     else {
-                        self.review_summaries.remove(&id);
+                        self.stale_reviews.insert(id.clone());
                         continue;
                     };
+                    self.stale_reviews.remove(&id);
                     let approved = snapshot.summary.all_approved();
                     let previous = self.review_approved.insert(id.clone(), approved);
                     if previous == Some(false)
@@ -2216,8 +2221,10 @@ mod tests {
             generation: 1,
             statuses: HashMap::from([(make_id(1), None)]),
         }));
-        assert!(!app.review_summaries.contains_key(&make_id(1)));
+        assert!(app.review_summaries.contains_key(&make_id(1)));
+        assert!(app.stale_reviews.contains(&make_id(1)));
         app.update(review_result(1, "sha", 2, 2, 0));
+        assert!(!app.stale_reviews.contains(&make_id(1)));
         assert!(app.pending_notifications.is_empty());
         app.update(review_result(1, "sha", 1, 2, 0));
         app.update(Message::ReviewResult(ReviewPayload {

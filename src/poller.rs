@@ -41,35 +41,95 @@ pub struct ReviewPayload {
     pub statuses: HashMap<PrId, Option<crate::github::reviews::ReviewSnapshot>>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct ReviewVersion {
+    updated_at: DateTime<Utc>,
+    head_sha: String,
+    decision: Option<ReviewDecision>,
+}
+struct ReviewCacheEntry {
+    version: ReviewVersion,
+    fresh_until: tokio::time::Instant,
+    retry_at: tokio::time::Instant,
+}
+const REVIEW_TTL: Duration = Duration::from_secs(300);
+const FAILURE_RETRY: Duration = Duration::from_secs(60);
+
 async fn fetch_reviews(
     states: &[TokenState],
     owners: &HashMap<PrId, usize>,
-    retained: &HashSet<PrId>,
+    prs: &IndexMap<PrId, PullRequest>,
+    shas: &HashMap<PrId, String>,
+    cache: &mut HashMap<PrId, ReviewCacheEntry>,
+    error_tx: &mpsc::Sender<String>,
 ) -> HashMap<PrId, Option<crate::github::reviews::ReviewSnapshot>> {
-    let mut jobs = JoinSet::new();
+    cache.retain(|id, _| prs.get(id).is_some_and(|pr| pr.state == PrState::Open));
     let mut statuses = HashMap::new();
-    for id in retained {
-        let Some(client) = owners
-            .get(id)
-            .and_then(|&i| states.get(i))
-            .map(|s| s.client.clone())
-        else {
+    let mut reported = HashSet::new();
+    for (id, pr) in prs {
+        if pr.state != PrState::Open {
+            continue;
+        }
+        let Some(&index) = owners.get(id) else {
             continue;
         };
-        if jobs.len() >= MAX_CONCURRENT_CI
-            && let Some(Ok((id, result))) = jobs.join_next().await
-        {
-            statuses.insert(id, result);
+        let Some(state) = states.get(index) else {
+            continue;
+        };
+        let now = tokio::time::Instant::now();
+        let version = ReviewVersion {
+            updated_at: pr.updated_at,
+            head_sha: shas.get(id).cloned().unwrap_or_default(),
+            decision: pr.review_decision.clone(),
+        };
+        if state.disabled || state.retrying {
+            if let Some(cached) = cache.get_mut(id) {
+                cached.fresh_until = now;
+            }
+            statuses.insert(id.clone(), None);
+            continue;
         }
-        let id = id.clone();
-        jobs.spawn(async move {
-            let result = client.fetch_review_summary(&id).await.ok();
-            (id, result)
-        });
-    }
-    while let Some(result) = jobs.join_next().await {
-        if let Ok((id, result)) = result {
-            statuses.insert(id, result);
+        if cache
+            .get(id)
+            .is_some_and(|c| now < c.retry_at || (c.version == version && now < c.fresh_until))
+        {
+            continue;
+        }
+        let result = state.client.fetch_review_summary(id).await;
+        let now = tokio::time::Instant::now();
+        match result {
+            Ok(snapshot) if snapshot.head_sha == version.head_sha => {
+                cache.insert(
+                    id.clone(),
+                    ReviewCacheEntry {
+                        version,
+                        fresh_until: now + REVIEW_TTL,
+                        retry_at: now,
+                    },
+                );
+                statuses.insert(id.clone(), Some(snapshot));
+            }
+            result => {
+                let error = match result {
+                    Err(e) => e.to_string(),
+                    _ => "PR changed during review fetch".into(),
+                };
+                if reported.insert(index) {
+                    let _ = error_tx.try_send(format!(
+                        "GitHub token #{}: Review fetch failed for {id}: {error}",
+                        index + 1
+                    ));
+                }
+                cache.insert(
+                    id.clone(),
+                    ReviewCacheEntry {
+                        version,
+                        fresh_until: now,
+                        retry_at: now + FAILURE_RETRY,
+                    },
+                );
+                statuses.insert(id.clone(), None);
+            }
         }
     }
     statuses
@@ -169,15 +229,21 @@ async fn fetch_ci_statuses(
     owners: &HashMap<PrId, usize>,
     retained: &HashSet<PrId>,
     mut shas: HashMap<PrId, String>,
+    error_tx: Option<&mpsc::Sender<String>>,
 ) -> HashMap<PrId, CiUpdate> {
     shas.retain(|id, sha| retained.contains(id) && !sha.is_empty() && owners.contains_key(id));
     let pending = shas.into_iter().filter_map(|(id, sha)| {
         let owner = owners.get(&id).copied()?;
-        let client = states.get(owner)?.client.clone();
+        let state = states.get(owner)?;
+        if state.disabled || state.retrying {
+            return None;
+        }
+        let client = state.client.clone();
         Some((id, sha, client))
     });
     let mut joinset: JoinSet<(PrId, String, Option<crate::types::CiStatus>)> = JoinSet::new();
     let mut statuses = HashMap::new();
+    let reported = Arc::new(Mutex::new(HashSet::new()));
 
     for (id, sha, client) in pending {
         if joinset.len() >= MAX_CONCURRENT_CI
@@ -191,11 +257,24 @@ async fn fetch_ci_statuses(
                 },
             );
         }
+        let error_tx = error_tx.cloned();
+        let reported = reported.clone();
+        let owner = owners.get(&id).copied().unwrap_or(0);
         joinset.spawn(async move {
             let ci = client
                 .fetch_ci_status(&id.owner, &id.repo, &sha)
                 .await
-                .unwrap_or(None);
+                .unwrap_or_else(|e| {
+                    if reported.lock().expect("error report lock").insert(owner)
+                        && let Some(tx) = error_tx
+                    {
+                        let _ = tx.try_send(format!(
+                            "GitHub token #{}: CI fetch failed for {id}: {e}",
+                            owner + 1
+                        ));
+                    }
+                    None
+                });
             (id, sha, ci)
         });
     }
@@ -321,6 +400,8 @@ pub async fn polling_loop(
     let interval = ctx.interval;
     let dismiss_store = ctx.dismiss_store.clone();
     let mut generation = 0u64;
+    let mut review_cache = HashMap::new();
+    let mut ci_cache: HashMap<PrId, (String, tokio::time::Instant)> = HashMap::new();
     let mut states: Vec<TokenState> = ctx
         .clients
         .into_iter()
@@ -416,7 +497,24 @@ pub async fn polling_loop(
                     &states,
                 )
                 .await;
-                let retained: HashSet<PrId> = prs.keys().cloned().collect();
+                // Closed search results remain available for transition detection, but
+                // invisible historical PRs must not receive per-PR enrichment requests.
+                let retained: HashSet<PrId> = prs
+                    .iter()
+                    .filter(|(_, pr)| pr.state == PrState::Open)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                ci_cache.retain(|id, _| retained.contains(id));
+                let ci_due: HashSet<PrId> = retained
+                    .iter()
+                    .filter(|id| {
+                        !ci_cache.get(*id).is_some_and(|(sha, until)| {
+                            shas.get(*id) == Some(sha) && tokio::time::Instant::now() < *until
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                let review_prs = prs.clone();
                 generation = generation.wrapping_add(1);
                 let snapshot_at = Utc::now();
                 let _ = tx
@@ -430,8 +528,29 @@ pub async fn polling_loop(
                 let enrich = async {
                     tokio::join!(
                         async {
-                            let statuses =
-                                fetch_ci_statuses(&states, &owners, &retained, shas).await;
+                            let statuses = fetch_ci_statuses(
+                                &states,
+                                &owners,
+                                &ci_due,
+                                shas.clone(),
+                                Some(&error_tx),
+                            )
+                            .await;
+                            for (id, update) in &statuses {
+                                let ttl = if update
+                                    .status
+                                    .as_ref()
+                                    .is_some_and(crate::types::CiStatus::is_finished)
+                                {
+                                    REVIEW_TTL
+                                } else {
+                                    FAILURE_RETRY
+                                };
+                                ci_cache.insert(
+                                    id.clone(),
+                                    (update.head_sha.clone(), tokio::time::Instant::now() + ttl),
+                                );
+                            }
                             let _ = tx
                                 .send(PollEvent::Ci(CiPayload {
                                     generation,
@@ -440,7 +559,15 @@ pub async fn polling_loop(
                                 .await;
                         },
                         async {
-                            let statuses = fetch_reviews(&states, &owners, &retained).await;
+                            let statuses = fetch_reviews(
+                                &states,
+                                &owners,
+                                &review_prs,
+                                &shas,
+                                &mut review_cache,
+                                &error_tx,
+                            )
+                            .await;
                             let _ = tx
                                 .send(PollEvent::Reviews(ReviewPayload {
                                     generation,
@@ -506,7 +633,11 @@ async fn apply_dismissals(
         }
     }
     for (index, candidates) in grouped {
-        let Some(client) = states.get(index).map(|s| &s.client) else {
+        let Some(client) = states
+            .get(index)
+            .filter(|s| !s.disabled && !s.retrying)
+            .map(|s| &s.client)
+        else {
             continue;
         };
         let ids: Vec<PrId> = candidates.iter().map(|(id, _)| id.clone()).collect();
@@ -838,7 +969,7 @@ mod tests {
             disabled: false,
         }];
         shas.insert(id, "absent-sha".into());
-        let statuses = fetch_ci_statuses(&states, &owners, &HashSet::new(), shas).await;
+        let statuses = fetch_ci_statuses(&states, &owners, &HashSet::new(), shas, None).await;
         assert!(statuses.is_empty());
         assert!(server.received_requests().await.unwrap().is_empty());
     }
@@ -895,7 +1026,7 @@ mod tests {
             shas.insert(id, format!("sha-{number}"));
         }
         let retained: HashSet<PrId> = owners.keys().cloned().collect();
-        let statuses = fetch_ci_statuses(&states, &owners, &retained, shas).await;
+        let statuses = fetch_ci_statuses(&states, &owners, &retained, shas, None).await;
         assert_eq!(statuses.len(), MAX_CONCURRENT_CI + 1);
         assert!(
             statuses
@@ -993,14 +1124,16 @@ mod tests {
             repo: "repo".into(),
             number: 7
         }));
-        let error = tokio::time::timeout(Duration::from_secs(5), error_rx.recv())
-            .await
-            .expect("timeout waiting for labelled auth error")
-            .expect("error channel closed");
-        assert!(
-            error.contains("GitHub token #2"),
-            "unexpected error: {error}"
-        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let error = error_rx.recv().await.expect("error channel closed");
+                if error.contains("GitHub token #2") && error.contains("Auth error") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timeout waiting for labelled auth error");
         cancel.cancel();
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await
@@ -1138,8 +1271,8 @@ mod tests {
         let (gate_tx, mut gate_rx) = mpsc::channel::<oneshot::Sender<()>>(4);
         let gate_handle =
             tokio::spawn(async move {
-                let mut handlers = Vec::with_capacity(4);
-                for _ in 0..4 {
+                let mut handlers = Vec::with_capacity(2);
+                for _ in 0..2 {
                     let (stream, _) = listener.accept().await.unwrap();
                     let gate_tx = gate_tx.clone();
                     handlers.push(tokio::spawn(async move {
@@ -1258,13 +1391,6 @@ mod tests {
             }
         };
 
-        for _ in 0..2 {
-            let release = tokio::time::timeout(Duration::from_secs(10), gate_rx.recv())
-                .await
-                .expect("timeout waiting for second-cycle CI request")
-                .expect("gate channel closed");
-            release.send(()).unwrap();
-        }
         let second_ci = tokio::time::timeout(Duration::from_secs(10), recv_non_review(&mut rx))
             .await
             .expect("timeout waiting for second CI event")
@@ -1272,9 +1398,9 @@ mod tests {
         match second_ci {
             PollEvent::Ci(payload) => {
                 assert_eq!(payload.generation, second_generation);
-                assert_eq!(
-                    payload.statuses.get(&expected_id).unwrap().status,
-                    Some(crate::types::CiStatus::Success)
+                assert!(
+                    payload.statuses.is_empty(),
+                    "unchanged completed CI must be cached"
                 );
             }
             PollEvent::Snapshot(_) | PollEvent::Reviews(_) => {
@@ -1291,5 +1417,111 @@ mod tests {
             .await
             .expect("timeout stopping gate server")
             .expect("gate server task panicked");
+    }
+
+    #[tokio::test]
+    async fn review_cache_rechecks_changes_and_ttl_but_skips_closed_history() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {"repository": {"pullRequest": {
+                "headRefOid":"sha", "updatedAt":"2026-01-01T00:00:00Z", "state":"OPEN", "isDraft":false,
+                "author":{"login":"author"},
+                "reviews":{"nodes":[], "pageInfo":{"hasNextPage":false,"endCursor":null}},
+                "reviewRequests":{"nodes":[], "pageInfo":{"hasNextPage":false,"endCursor":null}}
+            }}}
+        }))).mount(&server).await;
+        let states = vec![TokenState {
+            client: GitHubClient::new_with_base_url("token".into(), server.uri()),
+            cache: None,
+            next_poll: tokio::time::Instant::now(),
+            backoff_secs: 0,
+            retrying: false,
+            disabled: false,
+        }];
+        let mut node = make_node("org", "repo", 1);
+        node.head_ref_oid = "sha".into();
+        let (pr, sha) = node_to_pr(&node, PrRole::Author);
+        let id = pr.id.clone();
+        let mut closed = pr.clone();
+        closed.id.number = 2;
+        closed.state = PrState::Merged;
+        let mut prs = IndexMap::from([(id.clone(), pr), (closed.id.clone(), closed.clone())]);
+        let owners = HashMap::from([(id.clone(), 0), (closed.id.clone(), 0)]);
+        let mut shas = HashMap::from([(id.clone(), sha), (closed.id.clone(), "sha".into())]);
+        let mut cache = HashMap::new();
+        let (tx, _rx) = mpsc::channel(10);
+        assert_eq!(
+            fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &tx)
+                .await
+                .len(),
+            1
+        );
+        assert!(
+            fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &tx)
+                .await
+                .is_empty()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        prs.get_mut(&id).unwrap().updated_at += chrono::Duration::seconds(1);
+        assert_eq!(
+            fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &tx)
+                .await
+                .len(),
+            1
+        );
+        cache.get_mut(&id).unwrap().fresh_until = tokio::time::Instant::now();
+        assert_eq!(
+            fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &tx)
+                .await
+                .len(),
+            1
+        );
+        // A changed SHA invalidates the cache; a response for the old SHA is a failure.
+        shas.insert(id.clone(), "new-sha".into());
+        let result = fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &tx).await;
+        assert!(result[&id].is_none());
+        assert!(
+            fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &tx)
+                .await
+                .is_empty()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn enrichment_skips_disabled_and_retrying_tokens() {
+        let server = MockServer::start().await;
+        let (pr, _) = node_to_pr(&make_node("o", "r", 1), PrRole::Author);
+        let id = pr.id.clone();
+        let prs = IndexMap::from([(id.clone(), pr)]);
+        let owners = HashMap::from([(id.clone(), 0)]);
+        let shas = HashMap::from([(id.clone(), "sha".into())]);
+        let (tx, _rx) = mpsc::channel(10);
+        for disabled in [true, false] {
+            let states = vec![TokenState {
+                client: GitHubClient::new_with_base_url("token".into(), server.uri()),
+                cache: None,
+                next_poll: tokio::time::Instant::now(),
+                backoff_secs: 0,
+                retrying: !disabled,
+                disabled,
+            }];
+            let mut cache = HashMap::new();
+            assert!(
+                fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &tx).await[&id].is_none()
+            );
+            assert!(
+                fetch_ci_statuses(
+                    &states,
+                    &owners,
+                    &HashSet::from([id.clone()]),
+                    shas.clone(),
+                    None
+                )
+                .await
+                .is_empty()
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }
