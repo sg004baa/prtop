@@ -17,9 +17,9 @@ pub const MAX_PAGES: u64 = 4;
 
 #[derive(Clone)]
 pub struct GitHubClient {
-    client: Client,
-    token: String,
-    api_base: String,
+    pub(super) client: Client,
+    pub(super) token: String,
+    pub(super) api_base: String,
 }
 
 impl GitHubClient {
@@ -264,7 +264,7 @@ impl GitHubClient {
 
 /// GraphQL エンドポイントの HTTP レベルのエラー(401/403/rate limit/その他非2xx)を
 /// [`AppError`] に分類する。成功時はレスポンスをそのまま返す。
-async fn ensure_graphql_http_success(
+pub(super) async fn ensure_graphql_http_success(
     response: reqwest::Response,
 ) -> Result<reqwest::Response, AppError> {
     let status = response.status();

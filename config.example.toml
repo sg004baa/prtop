@@ -23,6 +23,7 @@ poll_interval_secs = 60
 #   ✅ pr_merged           — Your authored PR is merged
 #   ✅ re_review_requested — review_decision changes to ReviewRequired
 #   ✅ new_comment         — Comment count increases on your authored PR
+#   ✅ pr_approved         — All reviewers approve your open, non-draft PR
 #   ❌ ci_finished         — CI transitions from in-progress to success/failure
 #
 # `ci_finished` controls only whether a notification fires on CI transitions;
@@ -40,6 +41,7 @@ enabled = false
 # pr_merged           = true
 # re_review_requested = true
 # new_comment         = true
+# pr_approved         = true
 # ci_finished         = false
 
 # Colors

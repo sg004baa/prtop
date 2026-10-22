@@ -9,7 +9,7 @@ use crate::colors::ColorScheme;
 use crate::config::NotifyEvent;
 use crate::diff::diff_pr_sets;
 use crate::notify::Notification;
-use crate::poller::{CiPayload, CiUpdate, PollPayload};
+use crate::poller::{CiPayload, CiUpdate, PollPayload, ReviewPayload};
 use crate::types::{CiStatus, PrId, PrRole, PrState, PullRequest, ReviewDecision};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -45,6 +45,7 @@ pub enum Message {
     Deselect,
     PollResult(PollPayload),
     CiResult(CiPayload),
+    ReviewResult(ReviewPayload),
     PollError(String),
 }
 
@@ -68,6 +69,9 @@ pub struct App {
     pub pending_notifications: Vec<Notification>,
     /// Latest accepted snapshot generation. CI payloads from older snapshots are ignored.
     pub snapshot_generation: u64,
+    pub review_summaries: HashMap<PrId, crate::review::ReviewSummary>,
+    // Last complete observation survives fetch failures, preventing duplicate notifications.
+    review_approved: HashMap<PrId, bool>,
     pub snapshot_head_shas: HashMap<PrId, String>,
     /// DismissStore へ永続化する(pending_notifications と同じ drain パターン)。
     pub pending_dismissals: Vec<PrId>,
@@ -102,6 +106,8 @@ impl App {
             last_activity: None,
             pending_notifications: Vec::new(),
             snapshot_generation: 0,
+            review_summaries: HashMap::new(),
+            review_approved: HashMap::new(),
             snapshot_head_shas: HashMap::new(),
             pending_dismissals: Vec::new(),
             notify_events,
@@ -116,7 +122,10 @@ impl App {
         // Help 画面中はバックグラウンドのポール以外の全入力でhelpを閉じる
         if self.screen == Screen::Help {
             match &msg {
-                Message::PollResult(_) | Message::CiResult(_) | Message::PollError(_) => {}
+                Message::PollResult(_)
+                | Message::CiResult(_)
+                | Message::ReviewResult(_)
+                | Message::PollError(_) => {}
                 Message::Quit => {
                     self.should_quit = true;
                     self.dirty = true;
@@ -217,6 +226,10 @@ impl App {
                         pr.ci_status = self.prs.get(id).and_then(|old| old.ci_status.clone());
                     }
                 }
+                self.review_summaries.retain(|id, _| {
+                    incoming.contains_key(id)
+                        && self.snapshot_head_shas.get(id) == head_shas.get(id)
+                });
                 self.snapshot_head_shas = head_shas;
 
                 let already_loaded = matches!(self.loading, LoadingState::Loaded);
@@ -332,6 +345,10 @@ impl App {
                 // Selection follows a stable visible-row identity, not an index. This keeps role
                 // headers and PRs attached across deterministic re-sorts and poll rebuilds.
                 let selected = self.selected_row().cloned();
+                self.review_summaries
+                    .retain(|id, _| incoming.contains_key(id));
+                self.review_approved
+                    .retain(|id, _| incoming.contains_key(id));
                 self.prs = incoming;
                 sort_prs(&mut self.prs);
                 self.snapshot_head_shas
@@ -343,6 +360,40 @@ impl App {
 
                 if matches!(self.loading, LoadingState::Initial | LoadingState::Loading) {
                     self.loading = LoadingState::Loaded;
+                }
+                self.dirty = true;
+            }
+            Message::ReviewResult(payload) => {
+                if payload.generation != self.snapshot_generation {
+                    return;
+                }
+                for (id, snapshot) in payload.statuses {
+                    let Some(pr) = self.prs.get(&id) else {
+                        continue;
+                    };
+                    let Some(snapshot) =
+                        snapshot.filter(|s| self.snapshot_head_shas.get(&id) == Some(&s.head_sha))
+                    else {
+                        self.review_summaries.remove(&id);
+                        continue;
+                    };
+                    let approved = snapshot.summary.all_approved();
+                    let previous = self.review_approved.insert(id.clone(), approved);
+                    if previous == Some(false)
+                        && approved
+                        && pr.role == PrRole::Author
+                        && pr.state == PrState::Open
+                        && !pr.is_draft
+                        && snapshot.open
+                        && !snapshot.draft
+                        && self.notify_events.contains(&NotifyEvent::PrApproved)
+                    {
+                        self.pending_notifications.push(Notification {
+                            title: "PR approved".into(),
+                            body: format!("{} ({})", pr.title, id),
+                        });
+                    }
+                    self.review_summaries.insert(id, snapshot.summary);
                 }
                 self.dirty = true;
             }
@@ -2101,5 +2152,120 @@ mod tests {
             app.pending_notifications.is_empty(),
             "no CI notification on initial load"
         );
+    }
+
+    fn review_result(
+        generation: u64,
+        sha: &str,
+        approved: usize,
+        total: usize,
+        teams: usize,
+    ) -> Message {
+        Message::ReviewResult(ReviewPayload {
+            generation,
+            statuses: HashMap::from([(
+                make_id(1),
+                Some(crate::github::reviews::ReviewSnapshot {
+                    head_sha: sha.into(),
+                    open: true,
+                    draft: false,
+                    summary: crate::review::ReviewSummary {
+                        approved,
+                        total,
+                        pending_teams: teams,
+                        changes_requested: false,
+                    },
+                }),
+            )]),
+        })
+    }
+
+    fn review_app() -> App {
+        let mut app = test_app(NotifyEvent::all());
+        let id = make_id(1);
+        let mut payload = payload_from(IndexMap::from([(
+            id.clone(),
+            make_pr_custom(&id, PrRole::Author, None, 0),
+        )]));
+        payload.generation = 1;
+        payload.head_shas.insert(id, "sha".into());
+        app.update(Message::PollResult(payload));
+        app
+    }
+
+    #[test]
+    fn approval_counts_notify_on_completion_and_reapproval_without_timestamp_change() {
+        let mut app = review_app();
+        app.update(review_result(1, "sha", 1, 2, 0));
+        assert!(app.pending_notifications.is_empty());
+        app.update(review_result(1, "sha", 2, 2, 0));
+        app.update(review_result(1, "sha", 2, 2, 0));
+        assert_eq!(app.pending_notifications.len(), 1);
+        assert_eq!(app.pending_notifications[0].title, "PR approved");
+        app.update(review_result(1, "sha", 1, 2, 0));
+        app.update(review_result(1, "sha", 2, 2, 0));
+        assert_eq!(app.pending_notifications.len(), 2);
+    }
+
+    #[test]
+    fn first_approval_and_recovery_do_not_duplicate_notifications() {
+        let mut app = review_app();
+        app.update(review_result(1, "sha", 2, 2, 0));
+        assert!(app.pending_notifications.is_empty());
+        app.update(Message::ReviewResult(ReviewPayload {
+            generation: 1,
+            statuses: HashMap::from([(make_id(1), None)]),
+        }));
+        assert!(!app.review_summaries.contains_key(&make_id(1)));
+        app.update(review_result(1, "sha", 2, 2, 0));
+        assert!(app.pending_notifications.is_empty());
+        app.update(review_result(1, "sha", 1, 2, 0));
+        app.update(Message::ReviewResult(ReviewPayload {
+            generation: 1,
+            statuses: HashMap::from([(make_id(1), None)]),
+        }));
+        app.update(review_result(1, "sha", 2, 2, 0));
+        assert_eq!(app.pending_notifications.len(), 1);
+    }
+
+    #[test]
+    fn stale_results_teams_and_zero_reviewers_cannot_trigger_approval() {
+        let mut app = review_app();
+        app.update(review_result(1, "sha", 0, 0, 0));
+        app.update(review_result(0, "sha", 1, 1, 0));
+        app.update(review_result(1, "old-sha", 1, 1, 0));
+        app.update(review_result(1, "sha", 1, 1, 1));
+        assert!(app.pending_notifications.is_empty());
+        app.update(review_result(1, "sha", 1, 1, 0));
+        assert_eq!(app.pending_notifications.len(), 1);
+    }
+
+    #[test]
+    fn approval_notification_respects_role_state_draft_and_config() {
+        for case in [
+            "reviewer",
+            "mentioned",
+            "closed",
+            "merged",
+            "draft",
+            "disabled",
+        ] {
+            let mut app = review_app();
+            app.update(review_result(1, "sha", 0, 1, 0));
+            let pr = app.prs.get_mut(&make_id(1)).unwrap();
+            match case {
+                "reviewer" => pr.role = PrRole::ReviewRequested,
+                "mentioned" => pr.role = PrRole::Mentioned,
+                "closed" => pr.state = PrState::Closed,
+                "merged" => pr.state = PrState::Merged,
+                "draft" => pr.is_draft = true,
+                _ => {
+                    app.notify_events.remove(&NotifyEvent::PrApproved);
+                }
+            }
+            app.update(review_result(1, "sha", 1, 1, 0));
+            assert!(app.pending_notifications.is_empty(), "{case}");
+            assert!(app.review_summaries[&make_id(1)].all_approved());
+        }
     }
 }

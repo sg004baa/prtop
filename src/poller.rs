@@ -18,6 +18,7 @@ use crate::types::{PrId, PrRole, PrState, PullRequest, ReviewDecision};
 pub enum PollEvent {
     Snapshot(PollPayload),
     Ci(CiPayload),
+    Reviews(ReviewPayload),
 }
 
 pub struct PollPayload {
@@ -35,6 +36,45 @@ pub struct CiUpdate {
     pub head_sha: String,
     pub status: Option<crate::types::CiStatus>,
 }
+pub struct ReviewPayload {
+    pub generation: u64,
+    pub statuses: HashMap<PrId, Option<crate::github::reviews::ReviewSnapshot>>,
+}
+
+async fn fetch_reviews(
+    states: &[TokenState],
+    owners: &HashMap<PrId, usize>,
+    retained: &HashSet<PrId>,
+) -> HashMap<PrId, Option<crate::github::reviews::ReviewSnapshot>> {
+    let mut jobs = JoinSet::new();
+    let mut statuses = HashMap::new();
+    for id in retained {
+        let Some(client) = owners
+            .get(id)
+            .and_then(|&i| states.get(i))
+            .map(|s| s.client.clone())
+        else {
+            continue;
+        };
+        if jobs.len() >= MAX_CONCURRENT_CI
+            && let Some(Ok((id, result))) = jobs.join_next().await
+        {
+            statuses.insert(id, result);
+        }
+        let id = id.clone();
+        jobs.spawn(async move {
+            let result = client.fetch_review_summary(&id).await.ok();
+            (id, result)
+        });
+    }
+    while let Some(result) = jobs.join_next().await {
+        if let Ok((id, result)) = result {
+            statuses.insert(id, result);
+        }
+    }
+    statuses
+}
+
 const MAX_CONCURRENT_CI: usize = 16;
 
 fn parse_state(s: &str) -> PrState {
@@ -387,13 +427,33 @@ pub async fn polling_loop(
                         polled_at: snapshot_at,
                     }))
                     .await;
-                let statuses = fetch_ci_statuses(&states, &owners, &retained, shas).await;
-                let _ = tx
-                    .send(PollEvent::Ci(CiPayload {
-                        generation,
-                        statuses,
-                    }))
-                    .await;
+                let enrich = async {
+                    tokio::join!(
+                        async {
+                            let statuses =
+                                fetch_ci_statuses(&states, &owners, &retained, shas).await;
+                            let _ = tx
+                                .send(PollEvent::Ci(CiPayload {
+                                    generation,
+                                    statuses,
+                                }))
+                                .await;
+                        },
+                        async {
+                            let statuses = fetch_reviews(&states, &owners, &retained).await;
+                            let _ = tx
+                                .send(PollEvent::Reviews(ReviewPayload {
+                                    generation,
+                                    statuses,
+                                }))
+                                .await;
+                        }
+                    );
+                };
+                tokio::select! {
+                    _ = enrich => {},
+                    _ = cancel.cancelled() => return,
+                }
             }
         }
         let next = states
@@ -751,7 +811,7 @@ mod tests {
         loop {
             match rx.recv().await.expect("poll event channel closed") {
                 PollEvent::Snapshot(payload) => return payload,
-                PollEvent::Ci(_) => {}
+                PollEvent::Ci(_) | PollEvent::Reviews(_) => {}
             }
         }
     }
@@ -1050,6 +1110,15 @@ mod tests {
             .expect("task panicked");
     }
 
+    async fn recv_non_review(rx: &mut mpsc::Receiver<PollEvent>) -> Option<PollEvent> {
+        loop {
+            match rx.recv().await? {
+                PollEvent::Reviews(_) => continue,
+                event => return Some(event),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn polling_loop_refresh_triggers_early_poll() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1135,7 +1204,7 @@ mod tests {
             repo: "repo".to_string(),
             number: 1,
         };
-        let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        let first = tokio::time::timeout(Duration::from_secs(10), recv_non_review(&mut rx))
             .await
             .expect("timeout waiting for first snapshot")
             .expect("poll event channel closed");
@@ -1145,7 +1214,7 @@ mod tests {
                 assert_eq!(pr.ci_status, None);
                 payload.generation
             }
-            PollEvent::Ci(_) => panic!("CI arrived before first snapshot"),
+            PollEvent::Ci(_) | PollEvent::Reviews(_) => panic!("CI arrived before first snapshot"),
         };
 
         for _ in 0..2 {
@@ -1155,7 +1224,7 @@ mod tests {
                 .expect("gate channel closed");
             release.send(()).unwrap();
         }
-        let first_ci = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        let first_ci = tokio::time::timeout(Duration::from_secs(10), recv_non_review(&mut rx))
             .await
             .expect("timeout waiting for first CI event")
             .expect("poll event channel closed");
@@ -1167,11 +1236,13 @@ mod tests {
                     Some(crate::types::CiStatus::Success)
                 );
             }
-            PollEvent::Snapshot(_) => panic!("CI event missing after first snapshot"),
+            PollEvent::Snapshot(_) | PollEvent::Reviews(_) => {
+                panic!("CI event missing after first snapshot")
+            }
         }
 
         refresh_tx.send(()).await.unwrap();
-        let second = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        let second = tokio::time::timeout(Duration::from_secs(10), recv_non_review(&mut rx))
             .await
             .expect("timeout waiting for refresh-triggered snapshot")
             .expect("poll event channel closed");
@@ -1182,7 +1253,9 @@ mod tests {
                 assert!(payload.generation > first_generation);
                 payload.generation
             }
-            PollEvent::Ci(_) => panic!("CI arrived before refresh-triggered snapshot"),
+            PollEvent::Ci(_) | PollEvent::Reviews(_) => {
+                panic!("CI arrived before refresh-triggered snapshot")
+            }
         };
 
         for _ in 0..2 {
@@ -1192,7 +1265,7 @@ mod tests {
                 .expect("gate channel closed");
             release.send(()).unwrap();
         }
-        let second_ci = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        let second_ci = tokio::time::timeout(Duration::from_secs(10), recv_non_review(&mut rx))
             .await
             .expect("timeout waiting for second CI event")
             .expect("poll event channel closed");
@@ -1204,7 +1277,9 @@ mod tests {
                     Some(crate::types::CiStatus::Success)
                 );
             }
-            PollEvent::Snapshot(_) => panic!("CI event missing after second snapshot"),
+            PollEvent::Snapshot(_) | PollEvent::Reviews(_) => {
+                panic!("CI event missing after second snapshot")
+            }
         }
 
         cancel.cancel();
