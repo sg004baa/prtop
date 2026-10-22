@@ -8,7 +8,7 @@ A terminal-resident TUI that monitors GitHub pull requests you're involved in as
 
 - Lists PRs where you are the author, a requested reviewer, or mentioned, with status (Open/Closed/Merged)
 - Auto-refreshes on a configurable interval
-- Terminal notifications on key events (merged, review requested, re-review requested, mentioned)
+- Terminal notifications on key events (merged, review requested, re-review requested, mentioned, all reviewers approved)
 - Role-grouped keyboard navigation; Enter toggles groups or opens a PR
 - Mentioned PRs disappear once opened and come back only when you are mentioned again
 - Compact inline display — fits alongside other terminal panes
@@ -84,6 +84,7 @@ enabled = true
 # pr_merged           = true
 # re_review_requested = true
 # new_comment         = true
+# pr_approved         = true
 # ci_finished         = false
 ```
 
@@ -97,9 +98,10 @@ enabled = true
 | `pr_merged`           |    ✅    | Your authored PR is merged                                      |
 | `re_review_requested` |    ✅    | `review_decision` changes to `ReviewRequired`                   |
 | `new_comment`         |    ✅    | Comment count increases on your authored PR (self-comment skip) |
+| `pr_approved`         |    ✅    | All tracked reviewers approve your open, non-draft PR           |
 | `ci_finished`         |    ❌    | CI transitions from in-progress to success/failure (author only) |
 
-CI status is fetched every poll (per-PR REST calls to
+CI status is fetched for open PRs (per-PR REST calls to
 `/repos/{owner}/{repo}/commits/{sha}/status` and `/check-runs`) and shown in
 the `CI` column regardless of `ci_finished`. Each token needs the additional
 **Commit statuses: Read-only** and/or **Checks: Read-only** permissions;
@@ -113,6 +115,54 @@ new or changed commits show `-` until their CI status arrives.
 `ci_finished` controls only whether a *notification* fires when CI
 transitions from in-progress to success/failure. It defaults off because CI
 flapping can be noisy.
+
+## Review progress
+
+The `REVIEW` column shows `approved 1/2`: approvals out of unique people who
+have submitted a review or currently have a review request. The PR author and
+unsubmitted (pending) reviews are excluded. Below 100 terminal columns the
+label is shortened to `1/2`. A dash (`—`) means no reviewers; `?` means loading
+or an unavailable/incomplete review fetch.
+
+- A person's latest approval or changes-requested decision counts. A later
+  comment does not revoke that decision; a dismissed review does.
+- An outstanding review request makes that person unapproved, including a
+  re-review request after approval. People who only commented count as unapproved.
+- `!` marks a changes-requested decision. Green means everyone approved.
+- Outstanding team requests show `+ team pending` (`+team` on narrow terminals)
+  and block completion. Team membership is not expanded into the denominator.
+  Once the team request resolves, the individuals who reviewed are counted.
+- `0/0` never counts as approval. This is independent of GitHub's required
+  approval count / `reviewDecision` and does not imply that the PR is mergeable.
+
+Reviews and review requests are fetched asynchronously for open PRs, with
+pagination and the existing **Pull requests: Read-only** permission. Unchanged
+review summaries are cached for five minutes; a changed PR timestamp, review
+decision or head commit triggers an earlier check. Periodic rechecks also detect
+review changes that do not update the PR timestamp. Failed fetches retry no
+sooner than one minute later. Closed/merged search history is not enriched.
+
+Counts are published only after both connections are complete. A failed fetch
+keeps the previous count with `(stale)` (`~` on narrow terminals), in gray; `?`
+is used only when no complete count is available. Stale counts cannot generate
+approval notifications. A new head commit also marks the old count stale until
+its review fetch succeeds.
+
+Search, review, mention and CI requests share a per-token request gate. Requests
+are serialized per token, and HTTP 429/403 or GraphQL rate-limit errors stop
+queued requests until Retry-After / rate-limit reset (or a 60-second fallback).
+Failed authentication disables that token. Review/CI errors identify the token
+number and PR without displaying token values. Completed CI results are rechecked
+every five minutes; pending/unavailable CI is checked at most once per minute,
+with head changes bypassing the cache.
+
+`pr_approved` sends `PR approved` only when a previously observed incomplete
+review state becomes fully approved on your open, non-draft PR. The first
+successful observation is silent (including after startup or a PR first appears).
+Repeated complete states and recovery from a failed fetch do not repeat an
+already sent notification. If an incomplete state is observed and all reviewers
+approve again, it notifies again. Changes occurring entirely between polls cannot
+be detected. The event defaults on, subject to `[notify].enabled` (default off).
 
 ## Role Groups
 

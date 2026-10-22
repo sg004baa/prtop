@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use reqwest::Client;
@@ -17,18 +20,116 @@ pub const MAX_PAGES: u64 = 4;
 
 #[derive(Clone)]
 pub struct GitHubClient {
-    client: Client,
-    token: String,
-    api_base: String,
+    pub(super) client: Client,
+    pub(super) token: String,
+    pub(super) api_base: String,
+    gate: Arc<Mutex<RequestGate>>,
+}
+
+#[derive(Default)]
+struct RequestGate {
+    until: Option<tokio::time::Instant>,
+    disabled: bool,
 }
 
 impl GitHubClient {
+    /// All clones share one request gate, including search, reviews and REST CI.
+    /// Keep the gate through body decoding so HTTP-200 GraphQL limits stop queued work.
+    pub(super) async fn send_json<T: serde::de::DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        allow_missing: bool,
+    ) -> Result<Option<T>, AppError> {
+        let mut gate = self.gate.lock().await;
+        if gate.disabled {
+            return Err(AppError::Auth(
+                "Token disabled after authentication failure".into(),
+            ));
+        }
+        if let Some(until) = gate.until {
+            let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+            if !remaining.is_zero() {
+                return Err(AppError::RateLimited {
+                    retry_after_secs: remaining.as_secs().saturating_add(1),
+                });
+            }
+        }
+        let response = request.timeout(Duration::from_secs(30)).send().await?;
+        let status = response.status();
+        let headers = response.headers();
+        let retry = headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| {
+                s.parse::<u64>().ok().or_else(|| {
+                    chrono::DateTime::parse_from_rfc2822(s)
+                        .ok()
+                        .map(|d| (d.timestamp() - Utc::now().timestamp()).max(1) as u64)
+                })
+            });
+        let reset = headers
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(|t| (t - Utc::now().timestamp()).max(1) as u64);
+        let exhausted = headers
+            .get("x-ratelimit-remaining")
+            .is_some_and(|v| v == "0");
+        let body = response.text().await?;
+        let value = serde_json::from_str::<serde_json::Value>(&body);
+        let gql_limited = value
+            .as_ref()
+            .ok()
+            .and_then(|v| v.get("errors"))
+            .and_then(|v| v.as_array())
+            .is_some_and(|errors| {
+                errors.iter().any(|e| {
+                    e.get("type").and_then(|v| v.as_str()) == Some("RATE_LIMITED")
+                        || e.get("message")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(rate_limit_message)
+                })
+            });
+        let limited = status.as_u16() == 429
+            || gql_limited
+            || (!status.is_success()
+                && (exhausted || retry.is_some() || rate_limit_message(&body)));
+        if limited || exhausted {
+            let seconds = if exhausted {
+                retry.unwrap_or(0).max(reset.unwrap_or(60))
+            } else {
+                retry.unwrap_or(60).max(1)
+            };
+            gate.until = Some(tokio::time::Instant::now() + Duration::from_secs(seconds));
+            if limited {
+                return Err(AppError::RateLimited {
+                    retry_after_secs: seconds,
+                });
+            }
+        }
+        if status.as_u16() == 401 || (status.as_u16() == 403 && !allow_missing) {
+            gate.disabled = true;
+            return Err(AppError::Auth(format!("{status}: {body}")));
+        }
+        if allow_missing && matches!(status.as_u16(), 403 | 404) {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(AppError::GraphQl(format!("{status}: {body}")));
+        }
+        let value = value.map_err(|e| AppError::GraphQl(format!("Invalid JSON response: {e}")))?;
+        serde_json::from_value(value)
+            .map(Some)
+            .map_err(|e| AppError::GraphQl(format!("Invalid API response: {e}")))
+    }
+
     pub fn new(token: String) -> Self {
         Self {
             client: Client::builder()
                 .user_agent(concat!("prtop/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("failed to build HTTP client"),
+            gate: Arc::new(Mutex::new(RequestGate::default())),
             token,
             api_base: GITHUB_API_BASE.to_string(),
         }
@@ -41,6 +142,7 @@ impl GitHubClient {
                 .user_agent(concat!("prtop/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("failed to build HTTP client"),
+            gate: Arc::new(Mutex::new(RequestGate::default())),
             token,
             api_base,
         }
@@ -67,16 +169,12 @@ impl GitHubClient {
                 "variables": variables,
             });
 
-            let response = self
-                .client
-                .post(&url)
-                .bearer_auth(&self.token)
-                .json(&body)
-                .send()
-                .await?;
+            let request = self.client.post(&url).bearer_auth(&self.token).json(&body);
 
-            let response = ensure_graphql_http_success(response).await?;
-            let gql_response: GraphQlResponse = response.json().await?;
+            let gql_response: GraphQlResponse = self
+                .send_json(request, false)
+                .await?
+                .ok_or_else(|| AppError::GraphQl("Missing response".into()))?;
 
             if let Some(errors) = gql_response.errors {
                 let msgs: Vec<String> = errors.into_iter().map(|e| e.message).collect();
@@ -114,16 +212,12 @@ impl GitHubClient {
         let url = format!("{}/graphql", self.api_base);
         let body = json!({ "query": query::recent_comments_query(prs) });
 
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.token)
-            .json(&body)
-            .send()
-            .await?;
+        let request = self.client.post(&url).bearer_auth(&self.token).json(&body);
 
-        let response = ensure_graphql_http_success(response).await?;
-        let value: serde_json::Value = response.json().await?;
+        let value: serde_json::Value = self
+            .send_json(request, false)
+            .await?
+            .ok_or_else(|| AppError::GraphQl("Missing response".into()))?;
 
         if let Some(errors) = value.get("errors").and_then(|e| e.as_array()) {
             let msgs: Vec<String> = errors
@@ -213,23 +307,13 @@ impl GitHubClient {
             "{}/repos/{}/{}/commits/{}/status",
             self.api_base, owner, repo, sha
         );
-        let response = self
+        let request = self
             .client
             .get(&url)
             .bearer_auth(&self.token)
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await?;
+            .header("Accept", "application/vnd.github+json");
 
-        let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::FORBIDDEN {
-            return Ok(None);
-        }
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(AppError::GraphQl(format!("{status}: {text}")));
-        }
-        Ok(Some(response.json().await?))
+        self.send_json(request, true).await
     }
 
     async fn fetch_check_runs(
@@ -242,62 +326,21 @@ impl GitHubClient {
             "{}/repos/{}/{}/commits/{}/check-runs",
             self.api_base, owner, repo, sha
         );
-        let response = self
+        let request = self
             .client
             .get(&url)
             .bearer_auth(&self.token)
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await?;
+            .header("Accept", "application/vnd.github+json");
 
-        let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::FORBIDDEN {
-            return Ok(None);
-        }
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(AppError::GraphQl(format!("{status}: {text}")));
-        }
-        Ok(Some(response.json().await?))
+        self.send_json(request, true).await
     }
 }
 
-/// GraphQL エンドポイントの HTTP レベルのエラー(401/403/rate limit/その他非2xx)を
-/// [`AppError`] に分類する。成功時はレスポンスをそのまま返す。
-async fn ensure_graphql_http_success(
-    response: reqwest::Response,
-) -> Result<reqwest::Response, AppError> {
-    let status = response.status();
-
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
-
-        let rate_remaining = response
-            .headers()
-            .get("x-ratelimit-remaining")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
-
-        if rate_remaining == Some(0) || retry_after.is_some() {
-            return Err(AppError::RateLimited {
-                retry_after_secs: retry_after.unwrap_or(60),
-            });
-        }
-
-        let text = response.text().await.unwrap_or_default();
-        return Err(AppError::Auth(format!("{status}: {text}")));
-    }
-
-    if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
-        return Err(AppError::GraphQl(format!("{status}: {text}")));
-    }
-
-    Ok(response)
+fn rate_limit_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("rate limit")
+        || message.contains("rate_limit")
+        || message.contains("abuse detection")
 }
 
 fn compute_ci_status(
@@ -743,5 +786,91 @@ mod tests {
         let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
         let result = client.fetch_ci_status("o", "r", "abc").await.unwrap();
         assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn rate_limits_stop_all_endpoints_on_clones_until_cooldown_expires() {
+        for (status, body) in [
+            (429, serde_json::json!({"message":"slow down"})),
+            (403, serde_json::json!({"message":"secondary rate limit"})),
+            (
+                200,
+                serde_json::json!({"errors":[{"type":"RATE_LIMITED","message":"quota exceeded"}]}),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .mount(&server)
+                .await;
+            let client = GitHubClient::new_with_base_url("token".into(), server.uri());
+            assert!(matches!(
+                client.search_prs("author:a", 1).await,
+                Err(AppError::RateLimited { .. })
+            ));
+            let clone = client.clone();
+            assert!(matches!(
+                clone.fetch_ci_status("o", "r", "sha").await,
+                Err(AppError::RateLimited { .. })
+            ));
+            assert!(matches!(
+                clone
+                    .fetch_review_summary(&PrId {
+                        owner: "o".into(),
+                        repo: "r".into(),
+                        number: 1
+                    })
+                    .await,
+                Err(AppError::RateLimited { .. })
+            ));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            client.gate.lock().await.until = Some(tokio::time::Instant::now());
+            let _ = clone.search_prs("author:a", 1).await;
+            assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_rate_limit_honors_reset_and_stops_queued_search() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .append_header("x-ratelimit-remaining", "0")
+                    .append_header(
+                        "x-ratelimit-reset",
+                        (Utc::now().timestamp() + 3600).to_string(),
+                    )
+                    .set_body_json(json!({"message":"API rate limit exceeded"})),
+            )
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new_with_base_url("token".into(), server.uri());
+        match client.fetch_ci_status("o", "r", "sha").await {
+            Err(AppError::RateLimited { retry_after_secs }) => assert!(retry_after_secs > 3500),
+            _ => panic!("expected primary limit"),
+        }
+        assert!(matches!(
+            client.search_prs("author:a", 1).await,
+            Err(AppError::RateLimited { .. })
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_requests_stop_after_first_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new_with_base_url("token".into(), server.uri());
+        let (a, b, c) = tokio::join!(
+            client.search_prs("a", 1),
+            client.search_prs("b", 1),
+            client.search_prs("c", 1)
+        );
+        assert!(a.is_err() && b.is_err() && c.is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

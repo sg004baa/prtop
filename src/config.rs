@@ -17,6 +17,7 @@ pub enum NotifyEvent {
     ReReviewRequested,
     NewComment,
     CiFinished,
+    PrApproved,
 }
 
 impl NotifyEvent {
@@ -30,6 +31,7 @@ impl NotifyEvent {
             NotifyEvent::PrMerged,
             NotifyEvent::ReReviewRequested,
             NotifyEvent::NewComment,
+            NotifyEvent::PrApproved,
             NotifyEvent::CiFinished,
         ])
     }
@@ -46,6 +48,7 @@ impl NotifyEvent {
             NotifyEvent::PrMerged,
             NotifyEvent::ReReviewRequested,
             NotifyEvent::NewComment,
+            NotifyEvent::PrApproved,
         ])
     }
 }
@@ -70,6 +73,7 @@ struct NotifyFileConfig {
     re_review_requested: Option<bool>,
     new_comment: Option<bool>,
     ci_finished: Option<bool>,
+    pr_approved: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -127,6 +131,9 @@ fn resolve_notify_events(notify: &NotifyFileConfig) -> HashSet<NotifyEvent> {
     }
     if notify.new_comment.unwrap_or(true) {
         events.insert(NotifyEvent::NewComment);
+    }
+    if notify.pr_approved.unwrap_or(true) {
+        events.insert(NotifyEvent::PrApproved);
     }
     if notify.ci_finished.unwrap_or(false) {
         events.insert(NotifyEvent::CiFinished);
@@ -286,7 +293,7 @@ mod tests {
     #[test]
     fn notify_event_all_contains_every_variant() {
         let all = NotifyEvent::all();
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
         assert!(all.contains(&NotifyEvent::ReviewRequested));
         assert!(all.contains(&NotifyEvent::Mentioned));
         assert!(all.contains(&NotifyEvent::PrClosed));
@@ -306,6 +313,7 @@ mod tests {
             ("\"re_review_requested\"", NotifyEvent::ReReviewRequested),
             ("\"new_comment\"", NotifyEvent::NewComment),
             ("\"ci_finished\"", NotifyEvent::CiFinished),
+            ("\"pr_approved\"", NotifyEvent::PrApproved),
         ];
         for (json, expected) in cases {
             let parsed: NotifyEvent = serde_json::from_str(json).unwrap();
@@ -331,7 +339,7 @@ mod tests {
     #[test]
     fn defaults_excludes_ci_finished() {
         let defaults = NotifyEvent::defaults();
-        assert_eq!(defaults.len(), 6);
+        assert_eq!(defaults.len(), 7);
         assert!(defaults.contains(&NotifyEvent::ReviewRequested));
         assert!(defaults.contains(&NotifyEvent::Mentioned));
         assert!(defaults.contains(&NotifyEvent::PrClosed));
@@ -358,11 +366,13 @@ mod tests {
         let cfg = NotifyFileConfig {
             new_comment: Some(false),
             pr_merged: Some(false),
+            pr_approved: Some(false),
             ..Default::default()
         };
         let events = resolve_notify_events(&cfg);
         assert!(!events.contains(&NotifyEvent::NewComment));
         assert!(!events.contains(&NotifyEvent::PrMerged));
+        assert!(!events.contains(&NotifyEvent::PrApproved));
         assert!(events.contains(&NotifyEvent::ReviewRequested));
         assert!(events.contains(&NotifyEvent::PrClosed));
         assert!(events.contains(&NotifyEvent::ReReviewRequested));
@@ -378,6 +388,7 @@ mod tests {
             re_review_requested: Some(false),
             new_comment: Some(false),
             ci_finished: Some(false),
+            pr_approved: Some(false),
             ..Default::default()
         };
         assert!(resolve_notify_events(&cfg).is_empty());
