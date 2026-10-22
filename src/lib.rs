@@ -7,6 +7,7 @@ pub mod error;
 pub mod github;
 pub mod notify;
 pub mod poller;
+pub mod review;
 pub mod tui;
 pub mod types;
 pub mod ui_state;

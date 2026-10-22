@@ -16,15 +16,22 @@ pub fn view(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// Returns (status, ci, number, repo, title) column widths based on actual PR data lengths.
+/// Returns (status, ci, review, number, repo, title) column widths based on actual PR data lengths.
 /// Child layout: [▸ ][  ][status][  ][ci][  ][number][title][  ][repo]
-fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize, usize) {
+fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize, usize, usize) {
     let effective = (term_width as usize).saturating_sub(4); // highlight + tree indent
     let status: usize = 6; // "OPEN  ", "CLOSED", "MERGED"
     let ci: usize = 3; // "✓  ", "×  ", "...", "-  "
     let number: usize = 7; // "#12345 "
-    let seps: usize = 6;
-    let fixed = status + ci + seps + number;
+    let review = app
+        .prs
+        .keys()
+        .map(|id| review_display(app, id, term_width < 100).0.width())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+    let seps: usize = 8;
+    let fixed = status + ci + review + seps + number;
     let remaining = effective.saturating_sub(fixed);
 
     let max_repo = app.prs.keys().map(|id| id.repo.width()).max().unwrap_or(15);
@@ -42,7 +49,7 @@ fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize, usize)
         let title = remaining.saturating_sub(repo);
         (repo, title)
     };
-    (status, ci, number, repo, title)
+    (status, ci, review, number, repo, title)
 }
 
 fn pr_list_area(f: &Frame, app: &App) -> Rect {
@@ -110,9 +117,9 @@ fn render_col_header(
     f: &mut Frame,
     app: &App,
     area: Rect,
-    widths: (usize, usize, usize, usize, usize),
+    widths: (usize, usize, usize, usize, usize, usize),
 ) {
-    let (status_w, ci_w, num_w, repo_w, title_w) = widths;
+    let (status_w, ci_w, review_w, num_w, repo_w, title_w) = widths;
     let style = Style::default()
         .fg(app.colors.col_header)
         .add_modifier(Modifier::BOLD);
@@ -121,6 +128,8 @@ fn render_col_header(
         Span::styled(format!("{:<width$}", "STATUS", width = status_w), style),
         Span::raw("  "),
         Span::styled(format!("{:<width$}", "CI", width = ci_w), style),
+        Span::raw("  "),
+        Span::styled(format!("{:<width$}", "REVIEW", width = review_w), style),
         Span::raw("  "),
         Span::styled(format!("{:<width$}", "#", width = num_w), style),
         Span::styled(format!("{:<width$}", "TITLE", width = title_w), style),
@@ -134,7 +143,7 @@ fn render_list(
     f: &mut Frame,
     app: &mut App,
     area: Rect,
-    widths: (usize, usize, usize, usize, usize),
+    widths: (usize, usize, usize, usize, usize, usize),
 ) {
     match &app.loading {
         LoadingState::Initial | LoadingState::Loading => {
@@ -151,7 +160,7 @@ fn render_list(
         LoadingState::Loaded => {}
     }
 
-    let (status_w, ci_w, num_w, repo_w, title_w) = widths;
+    let (status_w, ci_w, review_w, num_w, repo_w, title_w) = widths;
     let item_count = app.visible_rows.len();
     if area.is_empty() {
         return;
@@ -225,6 +234,7 @@ fn render_list(
                     Style::default()
                 };
                 let (ci_tag, ci_style) = ci_cell(pr.ci_status.as_ref());
+                let (review_tag, review_style) = review_display(app, id, area.width < 100);
                 ListItem::new(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(
@@ -233,6 +243,8 @@ fn render_list(
                     ),
                     Span::raw("  "),
                     Span::styled(format!("{:<width$}", ci_tag, width = ci_w), ci_style),
+                    Span::raw("  "),
+                    Span::styled(pad(&review_tag, review_w), review_style),
                     Span::raw("  "),
                     Span::styled(
                         format!("{:<width$}", number_display, width = num_w),
@@ -321,6 +333,40 @@ fn role_label(role: PrRole) -> &'static str {
     }
 }
 
+fn review_display(app: &App, id: &crate::types::PrId, compact: bool) -> (String, Style) {
+    let (mut text, mut style) = review_cell(app.review_summaries.get(id), compact);
+    if app.stale_reviews.contains(id) && app.review_summaries.contains_key(id) {
+        text.push_str(if compact { " ~" } else { " (stale)" });
+        style = Style::default().fg(Color::DarkGray);
+    }
+    (text, style)
+}
+
+fn review_cell(summary: Option<&crate::review::ReviewSummary>, compact: bool) -> (String, Style) {
+    let Some(summary) = summary else {
+        return ("?".into(), Style::default().fg(Color::DarkGray));
+    };
+    if summary.total == 0 && summary.pending_teams == 0 {
+        return ("—".into(), Style::default().fg(Color::DarkGray));
+    }
+    let prefix = if compact { "" } else { "approved " };
+    let mut text = format!("{prefix}{}/{}", summary.approved, summary.total);
+    if summary.changes_requested {
+        text.push_str(" !");
+    }
+    if summary.pending_teams > 0 {
+        text.push_str(if compact { " +team" } else { " + team pending" });
+    }
+    let color = if summary.changes_requested {
+        Color::Red
+    } else if summary.all_approved() {
+        Color::Green
+    } else {
+        Color::Yellow
+    };
+    (text, Style::default().fg(color))
+}
+
 fn ci_cell(ci: Option<&CiStatus>) -> (&'static str, Style) {
     match ci {
         Some(CiStatus::Pending) => ("...", Style::default().fg(Color::Yellow)),
@@ -404,5 +450,99 @@ mod tests {
         assert_eq!(pad("abc", 5), "abc  ");
         // already wider: no truncation, no panic
         assert_eq!(pad("abcdef", 3), "abcdef");
+    }
+
+    #[test]
+    fn review_cells_distinguish_unknown_empty_partial_blocked_and_complete() {
+        use crate::review::ReviewSummary;
+        assert_eq!(review_cell(None, false).0, "?");
+        assert_eq!(review_cell(Some(&ReviewSummary::default()), false).0, "—");
+        let mut summary = ReviewSummary {
+            approved: 1,
+            total: 2,
+            ..Default::default()
+        };
+        assert_eq!(review_cell(Some(&summary), false).0, "approved 1/2");
+        assert_eq!(review_cell(Some(&summary), true).0, "1/2");
+        summary.changes_requested = true;
+        summary.pending_teams = 1;
+        let (text, style) = review_cell(Some(&summary), false);
+        assert_eq!(text, "approved 1/2 ! + team pending");
+        assert_eq!(style.fg, Some(Color::Red));
+        summary.changes_requested = false;
+        summary.pending_teams = 0;
+        summary.approved = 2;
+        assert_eq!(review_cell(Some(&summary), false).1.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn review_column_renders_on_wide_and_narrow_terminals() {
+        use crate::app::{LoadingState, Message};
+        use crate::poller::PollPayload;
+        use crate::review::ReviewSummary;
+        use crate::types::{PrId, PullRequest};
+        use chrono::Utc;
+        use indexmap::IndexMap;
+        use ratatui::{Terminal, backend::TestBackend};
+        use std::collections::{HashMap, HashSet};
+        for width in [50, 80, 120] {
+            let mut app = App::new(
+                "me".into(),
+                Default::default(),
+                HashSet::new(),
+                HashSet::new(),
+            );
+            let id = PrId {
+                owner: "org".into(),
+                repo: "repo".into(),
+                number: 1,
+            };
+            let pr = PullRequest {
+                id: id.clone(),
+                title: "Review progress".into(),
+                url: String::new(),
+                author_login: "me".into(),
+                role: PrRole::Author,
+                state: PrState::Open,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                is_draft: false,
+                review_decision: None,
+                total_comments: 0,
+                last_commenter: None,
+                ci_status: None,
+            };
+            app.update(Message::PollResult(PollPayload {
+                generation: 1,
+                prs: IndexMap::from([(id.clone(), pr)]),
+                head_shas: HashMap::new(),
+                polled_at: Utc::now(),
+            }));
+            app.loading = LoadingState::Loaded;
+            app.review_summaries.insert(
+                id.clone(),
+                ReviewSummary {
+                    approved: 1,
+                    total: 2,
+                    ..Default::default()
+                },
+            );
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            terminal.draw(|frame| view(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let row = |y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            };
+            assert!(row(1).contains("REVIEW"));
+            assert!(row(3).contains(if width < 100 { "1/2" } else { "approved 1/2" }));
+            assert!(row(3).contains("#1"));
+            app.stale_reviews.insert(id.clone());
+            let (label, style) = review_display(&app, &id, width < 100);
+            assert!(label.contains(if width < 100 { "~" } else { "(stale)" }));
+            assert_eq!(style.fg, Some(Color::DarkGray));
+            assert!(label.contains("1/2"));
+        }
     }
 }

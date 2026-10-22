@@ -7,6 +7,7 @@ mod error;
 mod github;
 mod notify;
 mod poller;
+mod review;
 mod tui;
 mod types;
 mod ui_state;
@@ -95,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let msg = match event {
                         poller::PollEvent::Snapshot(payload) => Message::PollResult(payload),
                         poller::PollEvent::Ci(payload) => Message::CiResult(payload),
+                        poller::PollEvent::Reviews(payload) => Message::ReviewResult(payload),
                     };
                     let _ = tx.send(msg).await;
                 }
