@@ -148,12 +148,34 @@ is used only when no complete count is available. Stale counts cannot generate
 approval notifications. A new head commit also marks the old count stale until
 its review fetch succeeds.
 
-Search, review, mention and CI requests share a per-token request gate. Requests
-are serialized per token, and HTTP 429/403 or GraphQL rate-limit errors stop
-queued requests until Retry-After / rate-limit reset (or a 60-second fallback).
-Failed authentication disables that token. Review/CI errors identify the token
-number and PR without displaying token values. Completed CI results are rechecked
-every five minutes; pending/unavailable CI is checked at most once per minute,
+Requests are serialized per token. Primary rate-limit cooldowns are tracked
+separately for GraphQL and REST (`core`), so exhausted CI quota does not stop PR
+searches, and cached PRs can still receive CI updates during a GraphQL cooldown.
+Secondary limits pause both resources. Requests queued during a cooldown are
+rejected locally without contacting GitHub. The client respects `Retry-After`
+and `x-ratelimit-reset`, with a 60-second fallback if the deadline is missing.
+A `503` with `Retry-After` is a temporary service failure, not a rate-limit error.
+
+Tokens belonging to the same GitHub user share primary quotas. prtop learns
+`viewer.id` from normal search responses (without an additional request) and
+shares observed cooldowns between tokens with the same verified user ID and API
+host. Tokens whose identity is not yet available remain separate, and different
+users are never grouped based on the configured username. State is in memory;
+restarting prtop does not reset GitHub's quota.
+
+Rate-limit diagnostics show the HTTP status, endpoint path, resource, remaining
+quota and UTC reset timestamp, or `unknown` for missing headers. Cached cooldown
+errors retain the original response evidence. Press `?` to inspect the last API
+error in the help screen, even after a subsequent successful poll clears the
+footer warning. Credentials and request bodies
+are excluded from this diagnostic. An actual exhausted primary quota still needs
+to wait for its reset; a long countdown alone does not prove the current process
+consumed that quota.
+
+On the initial successful load, only open-PR searches are performed (three
+searches per token before pagination, rather than six). Closed/merged searches
+resume on later polls to detect transitions of tracked PRs. Completed CI results
+are rechecked every five minutes; pending/unavailable CI at most once per minute,
 with head changes bypassing the cache.
 
 `pr_approved` sends `PR approved` only when a previously observed incomplete

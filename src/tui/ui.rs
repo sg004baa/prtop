@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, HighlightSpacing, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, HighlightSpacing, List, ListItem, Paragraph, Wrap};
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -297,8 +297,8 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(footer), area);
 }
 
-fn render_help(f: &mut Frame, _app: &mut App) {
-    let help_text = vec![
+fn render_help(f: &mut Frame, app: &mut App) {
+    let mut help_text = vec![
         Line::from(""),
         Line::from(Span::styled(
             " GitHub PR Live - Help",
@@ -321,7 +321,17 @@ fn render_help(f: &mut Frame, _app: &mut App) {
         )),
     ];
 
-    let help = Paragraph::new(help_text).block(Block::default().title(" Help "));
+    if let Some(error) = &app.last_api_error {
+        help_text.push(Line::from(""));
+        help_text.push(Line::styled(
+            " Last API error (may have recovered)",
+            Style::default().fg(Color::Yellow),
+        ));
+        help_text.extend(error.split("; ").map(Line::from));
+    }
+    let help = Paragraph::new(help_text)
+        .wrap(Wrap { trim: false })
+        .block(Block::default().title(" Help "));
     f.render_widget(help, f.area());
 }
 
@@ -543,6 +553,45 @@ mod tests {
             assert!(label.contains(if width < 100 { "~" } else { "(stale)" }));
             assert_eq!(style.fg, Some(Color::DarkGray));
             assert!(label.contains("1/2"));
+        }
+    }
+
+    #[test]
+    fn help_preserves_readable_diagnostics_after_successful_poll() {
+        use crate::app::Message;
+        use crate::poller::PollPayload;
+        use indexmap::IndexMap;
+        use ratatui::{Terminal, backend::TestBackend};
+        use std::collections::{HashMap, HashSet};
+        let mut app = App::new(
+            "me".into(),
+            Default::default(),
+            HashSet::new(),
+            HashSet::new(),
+        );
+        app.update(Message::PollError("GitHub token #2: primary limit; HTTP 200; resource=graphql; remaining=0; reset=2026-10-23T15:00:00Z".into()));
+        app.update(Message::PollResult(PollPayload {
+            generation: 1,
+            prs: IndexMap::new(),
+            head_shas: HashMap::new(),
+            polled_at: chrono::Utc::now(),
+        }));
+        assert!(app.poll_error.is_none());
+        app.screen = Screen::Help;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| view(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..24)
+            .flat_map(|y| (0..80).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        for expected in [
+            "token #2",
+            "HTTP 200",
+            "resource=graphql",
+            "remaining=0",
+            "reset=2026-10-23",
+        ] {
+            assert!(text.contains(expected), "{expected}");
         }
     }
 }

@@ -59,6 +59,7 @@ pub struct App {
     pub loading: LoadingState,
     pub last_poll: Option<DateTime<Utc>>,
     pub poll_error: Option<String>,
+    pub last_api_error: Option<String>,
     pub new_pr_ids: HashSet<PrId>,
     pub new_comment_pr_ids: HashSet<PrId>,
     pub dismissed_ids: HashSet<PrId>,
@@ -98,6 +99,7 @@ impl App {
             loading: LoadingState::Initial,
             last_poll: None,
             poll_error: None,
+            last_api_error: None,
             new_pr_ids: HashSet::new(),
             new_comment_pr_ids: HashSet::new(),
             dismissed_ids: HashSet::new(),
@@ -444,6 +446,7 @@ impl App {
                 }
             }
             Message::PollError(msg) => {
+                self.last_api_error = Some(msg.clone());
                 self.poll_error = Some(msg.clone());
                 // フッターは status_message を優先表示するため、"Refreshing..." が
                 // 残っているとエラーが見えないままになる。

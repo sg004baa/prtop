@@ -235,7 +235,7 @@ async fn fetch_ci_statuses(
     let pending = shas.into_iter().filter_map(|(id, sha)| {
         let owner = owners.get(&id).copied()?;
         let state = states.get(owner)?;
-        if state.disabled || state.retrying {
+        if state.disabled {
             return None;
         }
         let client = state.client.clone();
@@ -298,20 +298,31 @@ struct RawPoll {
     mentioned: Vec<PrNode>,
 }
 
-async fn fetch_raw(client: &GitHubClient, username: &str) -> Result<RawPoll, AppError> {
+async fn fetch_raw(
+    client: &GitHubClient,
+    username: &str,
+    include_closed: bool,
+) -> Result<RawPoll, AppError> {
     let author_query = query::author_search_query(username);
     let author_closed_query = query::author_closed_search_query(username);
     let review_query = query::review_requested_search_query(username);
     let review_closed_query = query::review_requested_closed_search_query(username);
     let mentions_query = query::mentions_search_query(username);
     let mentions_closed_query = query::mentions_closed_search_query(username);
+    let closed = |query: String| async move {
+        if include_closed {
+            client.search_prs(&query, 1).await
+        } else {
+            Ok(Vec::new())
+        }
+    };
     let (author_open, author_closed, review_open, review_closed, mentions_open, mentions_closed) = tokio::join!(
         client.search_prs(&author_query, MAX_PAGES),
-        client.search_prs(&author_closed_query, 1),
+        closed(author_closed_query),
         client.search_prs(&review_query, MAX_PAGES),
-        client.search_prs(&review_closed_query, 1),
+        closed(review_closed_query),
         client.search_prs(&mentions_query, MAX_PAGES),
-        client.search_prs(&mentions_closed_query, 1),
+        closed(mentions_closed_query),
     );
     let mut author = author_open?;
     author.extend(author_closed?);
@@ -428,7 +439,8 @@ pub async fn polling_loop(
             for &i in &due {
                 let client = states[i].client.clone();
                 let username = username.clone();
-                jobs.spawn(async move { (i, fetch_raw(&client, &username).await) });
+                let include_closed = states[i].cache.is_some();
+                jobs.spawn(async move { (i, fetch_raw(&client, &username, include_closed).await) });
             }
             while let Some(joined) = jobs.join_next().await {
                 let Ok((i, result)) = joined else { continue };
@@ -446,15 +458,27 @@ pub async fn polling_loop(
                             .send(format!("GitHub token #{}: Auth error: {msg}", i + 1))
                             .await;
                     }
-                    Err(AppError::RateLimited { retry_after_secs }) => {
+                    Err(
+                        error
+                        @ (AppError::RateLimited { .. } | AppError::ServiceUnavailable { .. }),
+                    ) => {
+                        let retry_after_secs = match &error {
+                            AppError::RateLimited {
+                                retry_after_secs, ..
+                            }
+                            | AppError::ServiceUnavailable {
+                                retry_after_secs, ..
+                            } => *retry_after_secs,
+                            _ => unreachable!(),
+                        };
                         states[i].retrying = true;
-                        states[i].next_poll =
-                            tokio::time::Instant::now() + Duration::from_secs(retry_after_secs);
+                        // Revisit cached PRs on the normal cadence so another API resource
+                        // can continue. The request gate suppresses actual blocked requests.
+                        states[i].next_poll = tokio::time::Instant::now()
+                            + Duration::from_secs(retry_after_secs)
+                                .min(interval.max(Duration::from_secs(1)));
                         let _ = error_tx
-                            .send(format!(
-                                "GitHub token #{}: Rate limited. Retry after {retry_after_secs}s",
-                                i + 1
-                            ))
+                            .send(format!("GitHub token #{}: {error}", i + 1))
                             .await;
                     }
                     Err(e) => {
@@ -1060,23 +1084,27 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(wiremock::matchers::header("authorization", "Bearer good"))
+            .and(wiremock::matchers::body_string_contains("search(query:"))
             .respond_with(ResponseTemplate::new(200).set_body_json(graphql_response_with_pr(42)))
-            .up_to_n_times(6)
+            .up_to_n_times(3)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(wiremock::matchers::header("authorization", "Bearer good"))
+            .and(wiremock::matchers::body_string_contains("search(query:"))
             .respond_with(ResponseTemplate::new(200).set_body_json(graphql_response_with_pr(43)))
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(wiremock::matchers::header("authorization", "Bearer bad"))
+            .and(wiremock::matchers::body_string_contains("search(query:"))
             .respond_with(ResponseTemplate::new(200).set_body_json(graphql_response_with_pr(7)))
-            .up_to_n_times(6)
+            .up_to_n_times(3)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(wiremock::matchers::header("authorization", "Bearer bad"))
+            .and(wiremock::matchers::body_string_contains("search(query:"))
             .respond_with(ResponseTemplate::new(401))
             .mount(&server)
             .await;
@@ -1510,18 +1538,50 @@ mod tests {
             assert!(
                 fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &tx).await[&id].is_none()
             );
-            assert!(
-                fetch_ci_statuses(
-                    &states,
-                    &owners,
-                    &HashSet::from([id.clone()]),
-                    shas.clone(),
-                    None
-                )
-                .await
-                .is_empty()
-            );
+            let ci = fetch_ci_statuses(
+                &states,
+                &owners,
+                &HashSet::from([id.clone()]),
+                shas.clone(),
+                None,
+            )
+            .await;
+            assert_eq!(ci.is_empty(), disabled);
         }
-        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn startup_omits_closed_searches_but_refresh_detects_closed_transitions() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_graphql_response()))
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new_with_base_url("token".into(), server.uri());
+        fetch_raw(&client, "user", false).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|r| {
+            !r.body_json::<serde_json::Value>().unwrap()["variables"]["query"]
+                .as_str()
+                .unwrap()
+                .contains("-is:open")
+        }));
+        fetch_raw(&client, "user", true).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 9);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(
+                    |r| r.body_json::<serde_json::Value>().unwrap()["variables"]["query"]
+                        .as_str()
+                        .unwrap()
+                        .contains("-is:open")
+                )
+                .count(),
+            3
+        );
     }
 }
