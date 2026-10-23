@@ -1,5 +1,6 @@
 pub const SEARCH_PRS_QUERY: &str = r#"
 query($query: String!, $first: Int!, $after: String) {
+  viewer { id }
   search(query: $query, type: ISSUE, first: $first, after: $after) {
     issueCount
     pageInfo {

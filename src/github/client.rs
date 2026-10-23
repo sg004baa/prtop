@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde_json::json;
 
+use super::limits::{Limits, SharedLimits, for_viewer};
 use crate::error::AppError;
 use crate::github::query::{self, SEARCH_PRS_QUERY};
 use crate::github::types::{
@@ -28,7 +29,9 @@ pub struct GitHubClient {
 
 #[derive(Default)]
 struct RequestGate {
-    until: Option<tokio::time::Instant>,
+    limits: SharedLimits,
+    services: Limits,
+    viewer: Option<String>,
     disabled: bool,
 }
 
@@ -46,15 +49,20 @@ impl GitHubClient {
                 "Token disabled after authentication failure".into(),
             ));
         }
-        if let Some(until) = gate.until {
-            let remaining = until.saturating_duration_since(tokio::time::Instant::now());
-            if !remaining.is_zero() {
-                return Err(AppError::RateLimited {
-                    retry_after_secs: remaining.as_secs().saturating_add(1),
-                });
-            }
+        let request = request.timeout(Duration::from_secs(30)).build()?;
+        let endpoint = request.url().path().to_string();
+        let resource = if endpoint == "/graphql" {
+            "graphql"
+        } else {
+            "core"
+        };
+        if let Some(error) = gate.services.check(resource) {
+            return Err(error);
         }
-        let response = request.timeout(Duration::from_secs(30)).send().await?;
+        if let Some(error) = gate.limits.lock().expect("rate limits").check(resource) {
+            return Err(error);
+        }
+        let response = self.client.execute(request).await?;
         let status = response.status();
         let headers = response.headers();
         let retry = headers
@@ -67,16 +75,34 @@ impl GitHubClient {
                         .map(|d| (d.timestamp() - Utc::now().timestamp()).max(1) as u64)
                 })
             });
-        let reset = headers
+        let reset_at = headers
             .get("x-ratelimit-reset")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<i64>().ok())
-            .map(|t| (t - Utc::now().timestamp()).max(1) as u64);
-        let exhausted = headers
+            .and_then(|s| s.parse::<i64>().ok());
+        let reset = reset_at.map(|t| t.saturating_sub(Utc::now().timestamp()).max(1) as u64);
+        let remaining = headers
             .get("x-ratelimit-remaining")
-            .is_some_and(|v| v == "0");
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        let response_resource = headers
+            .get("x-ratelimit-resource")
+            .and_then(|v| v.to_str().ok())
+            .filter(|r| matches!(*r, "core" | "graphql" | "search"))
+            .unwrap_or(resource)
+            .to_string();
+        let exhausted = remaining == Some(0);
         let body = response.text().await?;
         let value = serde_json::from_str::<serde_json::Value>(&body);
+        if let Some(viewer) = value
+            .as_ref()
+            .ok()
+            .and_then(|v| v.pointer("/data/viewer/id"))
+            .and_then(|v| v.as_str())
+            && gate.viewer.as_deref() != Some(viewer)
+        {
+            gate.limits = for_viewer(&self.api_base, viewer, &gate.limits);
+            gate.viewer = Some(viewer.to_string());
+        }
         let gql_limited = value
             .as_ref()
             .ok()
@@ -90,21 +116,84 @@ impl GitHubClient {
                             .is_some_and(rate_limit_message)
                 })
             });
-        let limited = status.as_u16() == 429
-            || gql_limited
-            || (!status.is_success()
-                && (exhausted || retry.is_some() || rate_limit_message(&body)));
-        if limited || exhausted {
-            let seconds = if exhausted {
+        let error_text = if status.is_success() {
+            value
+                .as_ref()
+                .ok()
+                .and_then(|v| v.get("errors"))
+                .and_then(|v| v.as_array())
+                .map(|errors| {
+                    errors
+                        .iter()
+                        .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .unwrap_or_default()
+        } else {
+            value
+                .as_ref()
+                .ok()
+                .and_then(|v| v.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or(&body)
+                .to_string()
+        };
+        let lower = error_text.to_ascii_lowercase();
+        let secondary = lower.contains("secondary rate limit") || lower.contains("abuse detection");
+        let limited = (matches!(status.as_u16(), 403 | 429)
+            && (exhausted
+                || retry.is_some()
+                || rate_limit_message(&error_text)
+                || status.as_u16() == 429))
+            || (status.is_success() && gql_limited);
+        let diagnostic = |kind: &str| {
+            format!(
+                "{kind}; HTTP {}; endpoint={endpoint}; resource={response_resource}; remaining={}; reset={}",
+                status.as_u16(),
+                remaining
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                reset_at
+                    .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                    .map(|d| d.to_rfc3339())
+                    .unwrap_or_else(|| "unknown".into())
+            )
+        };
+        if status.is_server_error()
+            && let Some(seconds) = retry
+        {
+            let cooldown =
+                gate.services
+                    .record(resource, seconds, diagnostic("service unavailable"), true);
+            return Err(cooldown.error().expect("new cooldown"));
+        }
+        if limited || (status.is_success() && exhausted) {
+            // Unknown 403/429 limits are conservatively shared; GraphQL RATE_LIMITED
+            // without secondary evidence applies to its own primary bucket.
+            let primary = !secondary && (exhausted || (status.is_success() && gql_limited));
+            let bucket = if primary {
+                response_resource.as_str()
+            } else {
+                "*"
+            };
+            let seconds = if primary {
                 retry.unwrap_or(0).max(reset.unwrap_or(60))
             } else {
                 retry.unwrap_or(60).max(1)
             };
-            gate.until = Some(tokio::time::Instant::now() + Duration::from_secs(seconds));
+            let cooldown = gate.limits.lock().expect("rate limits").record(
+                bucket,
+                seconds,
+                diagnostic(if primary {
+                    "primary limit"
+                } else {
+                    "secondary/shared limit"
+                }),
+                false,
+            );
             if limited {
-                return Err(AppError::RateLimited {
-                    retry_after_secs: seconds,
-                });
+                return Err(cooldown.error().expect("new cooldown"));
             }
         }
         if status.as_u16() == 401 || (status.as_u16() == 403 && !allow_missing) {
@@ -466,7 +555,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_rate_limited_on_401_with_rate_remaining_zero() {
+    async fn auth_failure_is_not_a_rate_limit_even_with_zero_remaining() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/graphql"))
@@ -476,12 +565,7 @@ mod tests {
 
         let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
         let result = client.search_prs("author:user", MAX_PAGES).await;
-        assert!(matches!(
-            result,
-            Err(AppError::RateLimited {
-                retry_after_secs: 60
-            })
-        ));
+        assert!(matches!(result, Err(AppError::Auth(_))));
     }
 
     #[tokio::test]
@@ -498,7 +582,8 @@ mod tests {
         assert!(matches!(
             result,
             Err(AppError::RateLimited {
-                retry_after_secs: 30
+                retry_after_secs: 30,
+                ..
             })
         ));
     }
@@ -793,10 +878,6 @@ mod tests {
         for (status, body) in [
             (429, serde_json::json!({"message":"slow down"})),
             (403, serde_json::json!({"message":"secondary rate limit"})),
-            (
-                200,
-                serde_json::json!({"errors":[{"type":"RATE_LIMITED","message":"quota exceeded"}]}),
-            ),
         ] {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
@@ -824,14 +905,14 @@ mod tests {
                 Err(AppError::RateLimited { .. })
             ));
             assert_eq!(server.received_requests().await.unwrap().len(), 1);
-            client.gate.lock().await.until = Some(tokio::time::Instant::now());
+            client.gate.lock().await.limits.lock().unwrap().clear();
             let _ = clone.search_prs("author:a", 1).await;
             assert_eq!(server.received_requests().await.unwrap().len(), 2);
         }
     }
 
     #[tokio::test]
-    async fn rest_rate_limit_honors_reset_and_stops_queued_search() {
+    async fn rest_primary_limit_honors_reset_but_allows_graphql() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(
@@ -845,16 +926,23 @@ mod tests {
             )
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_response()))
+            .mount(&server)
+            .await;
         let client = GitHubClient::new_with_base_url("token".into(), server.uri());
         match client.fetch_ci_status("o", "r", "sha").await {
-            Err(AppError::RateLimited { retry_after_secs }) => assert!(retry_after_secs > 3500),
+            Err(AppError::RateLimited {
+                retry_after_secs, ..
+            }) => assert!(retry_after_secs > 3500),
             _ => panic!("expected primary limit"),
         }
+        assert!(client.search_prs("author:a", 1).await.is_ok());
         assert!(matches!(
-            client.search_prs("author:a", 1).await,
+            client.fetch_ci_status("o", "r", "sha").await,
             Err(AppError::RateLimited { .. })
         ));
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -872,5 +960,151 @@ mod tests {
         );
         assert!(a.is_err() && b.is_err() && c.is_err());
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn graphql_primary_limit_does_not_block_rest_and_keeps_diagnostics() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("x-ratelimit-resource", "graphql")
+                    .append_header("x-ratelimit-remaining", "0")
+                    .append_header(
+                        "x-ratelimit-reset",
+                        (Utc::now().timestamp() + 1986).to_string(),
+                    )
+                    .set_body_json(
+                        json!({"errors":[{"type":"RATE_LIMITED","message":"quota exceeded"}]}),
+                    ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new_with_base_url("secret-token".into(), server.uri());
+        let error = client.search_prs("author:a", 1).await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("primary limit"));
+        assert!(message.contains("HTTP 200"));
+        assert!(message.contains("resource=graphql"));
+        assert!(message.contains("remaining=0"));
+        assert!(message.contains("reset=20"));
+        assert!(!message.contains("secret-token"));
+        assert!(matches!(
+            client
+                .fetch_review_summary(&PrId {
+                    owner: "o".into(),
+                    repo: "r".into(),
+                    number: 1
+                })
+                .await,
+            Err(AppError::RateLimited { .. })
+        ));
+        assert_eq!(client.fetch_ci_status("o", "r", "sha").await.unwrap(), None);
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn service_retry_after_is_not_rate_limit_or_auth_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .append_header("retry-after", "120")
+                    .set_body_string("backend unavailable"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new_with_base_url("token".into(), server.uri());
+        let error = client.search_prs("a", 1).await.unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::ServiceUnavailable {
+                retry_after_secs: 120,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("HTTP 503"));
+        assert!(!error.to_string().contains("rate limited"));
+        assert!(matches!(
+            client.search_prs("a", 1).await,
+            Err(AppError::ServiceUnavailable { .. })
+        ));
+        assert!(client.fetch_ci_status("o", "r", "sha").await.is_ok());
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        assert!(!client.gate.lock().await.disabled);
+    }
+
+    #[tokio::test]
+    async fn successful_last_quota_response_is_delivered_before_resource_cooldown() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("x-ratelimit-remaining", "0")
+                    .set_body_json(empty_response()),
+            )
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new_with_base_url("token".into(), server.uri());
+        assert!(client.search_prs("a", 1).await.is_ok());
+        assert!(matches!(
+            client.search_prs("a", 1).await,
+            Err(AppError::RateLimited { .. })
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn verified_same_user_tokens_share_limits_but_other_users_do_not() {
+        let server = MockServer::start().await;
+        for (token, viewer) in [("a", "user-1"), ("b", "user-1"), ("c", "user-2")] {
+            let mut body = empty_response();
+            body["data"]["viewer"] = json!({"id":viewer});
+            Mock::given(method("POST"))
+                .and(wiremock::matchers::header(
+                    "authorization",
+                    format!("Bearer {token}"),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::header("authorization", "Bearer a"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .append_header("x-ratelimit-remaining", "0")
+                    .append_header("x-ratelimit-resource", "core")
+                    .set_body_json(json!({"message":"API rate limit exceeded"})),
+            )
+            .mount(&server)
+            .await;
+        let a = GitHubClient::new_with_base_url("a".into(), server.uri());
+        let b = GitHubClient::new_with_base_url("b".into(), server.uri());
+        let c = GitHubClient::new_with_base_url("c".into(), server.uri());
+        for client in [&a, &b, &c] {
+            client.search_prs("a", 1).await.unwrap();
+        }
+        assert!(matches!(
+            a.fetch_ci_status("o", "r", "sha").await,
+            Err(AppError::RateLimited { .. })
+        ));
+        assert!(matches!(
+            b.fetch_ci_status("o", "r", "sha").await,
+            Err(AppError::RateLimited { .. })
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+        // The independent user's REST calls reach the server (404 is allowed).
+        assert!(c.fetch_ci_status("o", "r", "sha").await.is_ok());
+        assert_eq!(server.received_requests().await.unwrap().len(), 6);
+        assert!(b.search_prs("a", 1).await.is_ok());
     }
 }
