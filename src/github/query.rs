@@ -18,6 +18,17 @@ query($query: String!, $first: Int!, $after: String) {
         updatedAt
         reviewDecision
         headRefOid
+        commits(last: 1) {
+          nodes {
+            commit {
+              oid
+              statusCheckRollup {
+                state
+                contexts { totalCount }
+              }
+            }
+          }
+        }
         author {
           login
         }

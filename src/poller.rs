@@ -135,8 +135,6 @@ async fn fetch_reviews(
     statuses
 }
 
-const MAX_CONCURRENT_CI: usize = 16;
-
 fn parse_state(s: &str) -> PrState {
     match s {
         "OPEN" => PrState::Open,
@@ -146,8 +144,7 @@ fn parse_state(s: &str) -> PrState {
     }
 }
 
-/// Convert a GraphQL PR node to a domain PullRequest. `ci_status` is left `None`;
-/// it is populated by [`enrich_with_ci_status`] in a separate REST call.
+/// Convert a PR and its head-commit CI rollup from the same search response.
 fn node_to_pr(node: &PrNode, role: PrRole) -> (PullRequest, String) {
     let id = PrId {
         owner: node.repository.owner.login.clone(),
@@ -177,7 +174,7 @@ fn node_to_pr(node: &PrNode, role: PrRole) -> (PullRequest, String) {
             .first()
             .and_then(|c| c.author.as_ref())
             .map(|a| a.login.clone()),
-        ci_status: None,
+        ci_status: node.ci_status(),
     };
     (pr, head_sha)
 }
@@ -223,73 +220,6 @@ pub fn merge_and_convert(
         }
     }
     (result, shas)
-}
-async fn fetch_ci_statuses(
-    states: &[TokenState],
-    owners: &HashMap<PrId, usize>,
-    retained: &HashSet<PrId>,
-    mut shas: HashMap<PrId, String>,
-    error_tx: Option<&mpsc::Sender<String>>,
-) -> HashMap<PrId, CiUpdate> {
-    shas.retain(|id, sha| retained.contains(id) && !sha.is_empty() && owners.contains_key(id));
-    let pending = shas.into_iter().filter_map(|(id, sha)| {
-        let owner = owners.get(&id).copied()?;
-        let state = states.get(owner)?;
-        if state.disabled {
-            return None;
-        }
-        let client = state.client.clone();
-        Some((id, sha, client))
-    });
-    let mut joinset: JoinSet<(PrId, String, Option<crate::types::CiStatus>)> = JoinSet::new();
-    let mut statuses = HashMap::new();
-    let reported = Arc::new(Mutex::new(HashSet::new()));
-
-    for (id, sha, client) in pending {
-        if joinset.len() >= MAX_CONCURRENT_CI
-            && let Some(Ok((id, sha, ci))) = joinset.join_next().await
-        {
-            statuses.insert(
-                id,
-                CiUpdate {
-                    head_sha: sha,
-                    status: ci,
-                },
-            );
-        }
-        let error_tx = error_tx.cloned();
-        let reported = reported.clone();
-        let owner = owners.get(&id).copied().unwrap_or(0);
-        joinset.spawn(async move {
-            let ci = client
-                .fetch_ci_status(&id.owner, &id.repo, &sha)
-                .await
-                .unwrap_or_else(|e| {
-                    if reported.lock().expect("error report lock").insert(owner)
-                        && let Some(tx) = error_tx
-                    {
-                        let _ = tx.try_send(format!(
-                            "GitHub token #{}: CI fetch failed for {id}: {e}",
-                            owner + 1
-                        ));
-                    }
-                    None
-                });
-            (id, sha, ci)
-        });
-    }
-    while let Some(res) = joinset.join_next().await {
-        if let Ok((id, sha, ci)) = res {
-            statuses.insert(
-                id,
-                CiUpdate {
-                    head_sha: sha,
-                    status: ci,
-                },
-            );
-        }
-    }
-    statuses
 }
 #[derive(Default)]
 struct RawPoll {
@@ -412,7 +342,6 @@ pub async fn polling_loop(
     let dismiss_store = ctx.dismiss_store.clone();
     let mut generation = 0u64;
     let mut review_cache = HashMap::new();
-    let mut ci_cache: HashMap<PrId, (String, tokio::time::Instant)> = HashMap::new();
     let mut states: Vec<TokenState> = ctx
         .clients
         .into_iter()
@@ -472,11 +401,9 @@ pub async fn polling_loop(
                             _ => unreachable!(),
                         };
                         states[i].retrying = true;
-                        // Revisit cached PRs on the normal cadence so another API resource
-                        // can continue. The request gate suppresses actual blocked requests.
+                        // Search, CI and review updates all use GraphQL now.
                         states[i].next_poll = tokio::time::Instant::now()
-                            + Duration::from_secs(retry_after_secs)
-                                .min(interval.max(Duration::from_secs(1)));
+                            + Duration::from_secs(retry_after_secs.max(1));
                         let _ = error_tx
                             .send(format!("GitHub token #{}: {error}", i + 1))
                             .await;
@@ -521,22 +448,22 @@ pub async fn polling_loop(
                     &states,
                 )
                 .await;
-                // Closed search results remain available for transition detection, but
-                // invisible historical PRs must not receive per-PR enrichment requests.
-                let retained: HashSet<PrId> = prs
-                    .iter()
-                    .filter(|(_, pr)| pr.state == PrState::Open)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                ci_cache.retain(|id, _| retained.contains(id));
-                let ci_due: HashSet<PrId> = retained
-                    .iter()
-                    .filter(|id| {
-                        !ci_cache.get(*id).is_some_and(|(sha, until)| {
-                            shas.get(*id) == Some(sha) && tokio::time::Instant::now() < *until
+                // Keep the existing CI event/notification path, but obtain all values
+                // from this search snapshot. No per-PR CI network calls are needed.
+                let statuses = prs
+                    .iter_mut()
+                    .filter_map(|(id, pr)| {
+                        let status = pr.ci_status.take();
+                        (pr.state == PrState::Open).then(|| {
+                            (
+                                id.clone(),
+                                CiUpdate {
+                                    head_sha: shas.get(id).cloned().unwrap_or_default(),
+                                    status,
+                                },
+                            )
                         })
                     })
-                    .cloned()
                     .collect();
                 let review_prs = prs.clone();
                 generation = generation.wrapping_add(1);
@@ -549,57 +476,28 @@ pub async fn polling_loop(
                         polled_at: snapshot_at,
                     }))
                     .await;
+                let _ = tx
+                    .send(PollEvent::Ci(CiPayload {
+                        generation,
+                        statuses,
+                    }))
+                    .await;
                 let enrich = async {
-                    tokio::join!(
-                        async {
-                            let statuses = fetch_ci_statuses(
-                                &states,
-                                &owners,
-                                &ci_due,
-                                shas.clone(),
-                                Some(&error_tx),
-                            )
-                            .await;
-                            for (id, update) in &statuses {
-                                let ttl = if update
-                                    .status
-                                    .as_ref()
-                                    .is_some_and(crate::types::CiStatus::is_finished)
-                                {
-                                    REVIEW_TTL
-                                } else {
-                                    FAILURE_RETRY
-                                };
-                                ci_cache.insert(
-                                    id.clone(),
-                                    (update.head_sha.clone(), tokio::time::Instant::now() + ttl),
-                                );
-                            }
-                            let _ = tx
-                                .send(PollEvent::Ci(CiPayload {
-                                    generation,
-                                    statuses,
-                                }))
-                                .await;
-                        },
-                        async {
-                            let statuses = fetch_reviews(
-                                &states,
-                                &owners,
-                                &review_prs,
-                                &shas,
-                                &mut review_cache,
-                                &error_tx,
-                            )
-                            .await;
-                            let _ = tx
-                                .send(PollEvent::Reviews(ReviewPayload {
-                                    generation,
-                                    statuses,
-                                }))
-                                .await;
-                        }
-                    );
+                    let statuses = fetch_reviews(
+                        &states,
+                        &owners,
+                        &review_prs,
+                        &shas,
+                        &mut review_cache,
+                        &error_tx,
+                    )
+                    .await;
+                    let _ = tx
+                        .send(PollEvent::Reviews(ReviewPayload {
+                            generation,
+                            statuses,
+                        }))
+                        .await;
                 };
                 tokio::select! {
                     _ = enrich => {},
@@ -734,6 +632,7 @@ mod tests {
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             review_decision: None,
             head_ref_oid: String::new(),
+            commits: None,
             author: Some(ActorNode {
                 login: "user".to_string(),
             }),
@@ -970,94 +869,6 @@ mod tests {
             }
         }
     }
-    #[tokio::test]
-    async fn ci_enrichment_ignores_absent_prs_without_requests() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-        let id = PrId {
-            owner: "org".into(),
-            repo: "repo".into(),
-            number: 99,
-        };
-        let mut shas = HashMap::new();
-        let owners = HashMap::from([(id.clone(), 0)]);
-        let states = vec![TokenState {
-            client: GitHubClient::new_with_base_url("token".into(), server.uri()),
-            cache: None,
-            next_poll: tokio::time::Instant::now(),
-            backoff_secs: 0,
-            retrying: false,
-            disabled: false,
-        }];
-        shas.insert(id, "absent-sha".into());
-        let statuses = fetch_ci_statuses(&states, &owners, &HashSet::new(), shas, None).await;
-        assert!(statuses.is_empty());
-        assert!(server.received_requests().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn ci_enrichment_completes_more_than_window_with_correct_tokens() {
-        let server = MockServer::start().await;
-        for (token, owner) in [("token-a", "org-a"), ("token-b", "org-b")] {
-            Mock::given(method("GET"))
-                .and(wiremock::matchers::header(
-                    "authorization",
-                    format!("Bearer {token}"),
-                ))
-                .and(wiremock::matchers::path_regex(format!(
-                    "^/repos/{owner}/repo/commits/"
-                )))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "state": "success", "statuses": [{}], "total_count": 0, "check_runs": []
-                })))
-                .mount(&server)
-                .await;
-        }
-        let states = vec![
-            TokenState {
-                client: GitHubClient::new_with_base_url("token-a".into(), server.uri()),
-                cache: None,
-                next_poll: tokio::time::Instant::now(),
-                backoff_secs: 0,
-                retrying: false,
-                disabled: false,
-            },
-            TokenState {
-                client: GitHubClient::new_with_base_url("token-b".into(), server.uri()),
-                cache: None,
-                next_poll: tokio::time::Instant::now(),
-                backoff_secs: 0,
-                retrying: false,
-                disabled: false,
-            },
-        ];
-        let mut shas = HashMap::new();
-        let mut owners = HashMap::new();
-        for number in 0..(MAX_CONCURRENT_CI as u64 + 1) {
-            let id = PrId {
-                owner: if number % 2 == 0 {
-                    "org-a".into()
-                } else {
-                    "org-b".into()
-                },
-                repo: "repo".into(),
-                number,
-            };
-            owners.insert(id.clone(), (number % 2) as usize);
-            shas.insert(id, format!("sha-{number}"));
-        }
-        let retained: HashSet<PrId> = owners.keys().cloned().collect();
-        let statuses = fetch_ci_statuses(&states, &owners, &retained, shas, None).await;
-        assert_eq!(statuses.len(), MAX_CONCURRENT_CI + 1);
-        assert!(
-            statuses
-                .values()
-                .all(|update| update.status == Some(crate::types::CiStatus::Success))
-        );
-    }
     fn graphql_response_with_pr(number: u64) -> serde_json::Value {
         serde_json::json!({
             "data": {"search": {
@@ -1280,171 +1091,167 @@ mod tests {
         }
     }
 
+    fn with_ci(
+        mut response: serde_json::Value,
+        sha: &str,
+        state: Option<&str>,
+    ) -> serde_json::Value {
+        let node = &mut response["data"]["search"]["nodes"][0];
+        node["headRefOid"] = sha.into();
+        node["commits"] = serde_json::json!({"nodes": [{"commit": {
+            "oid": sha,
+            "statusCheckRollup": state.map(|state| serde_json::json!({
+                "state": state, "contexts": {"totalCount": 1}
+            }))
+        }}]});
+        response
+    }
+
+    #[test]
+    fn ci_rollup_maps_states_and_rejects_empty_or_mismatched_heads() {
+        use crate::types::CiStatus;
+        for (state, expected) in [
+            (Some("SUCCESS"), Some(CiStatus::Success)),
+            (Some("FAILURE"), Some(CiStatus::Failure)),
+            (Some("ERROR"), Some(CiStatus::Failure)),
+            (Some("PENDING"), Some(CiStatus::Pending)),
+            (Some("EXPECTED"), Some(CiStatus::Pending)),
+            (Some("FUTURE_STATE"), None),
+            (None, None),
+        ] {
+            let response = with_ci(graphql_response_with_pr(1), "sha", state);
+            let node: PrNode =
+                serde_json::from_value(response["data"]["search"]["nodes"][0].clone()).unwrap();
+            assert_eq!(node_to_pr(&node, PrRole::Author).0.ci_status, expected);
+        }
+        let response = with_ci(graphql_response_with_pr(1), "sha", Some("SUCCESS"));
+        let base = response["data"]["search"]["nodes"][0].clone();
+        for replacement in [serde_json::Value::Null, serde_json::json!({"nodes": []})] {
+            let mut node = base.clone();
+            node["commits"] = replacement;
+            assert_eq!(
+                serde_json::from_value::<PrNode>(node).unwrap().ci_status(),
+                None
+            );
+        }
+        for sha in ["different", ""] {
+            let mut node = base.clone();
+            node["headRefOid"] = sha.into();
+            assert_eq!(
+                serde_json::from_value::<PrNode>(node).unwrap().ci_status(),
+                None
+            );
+        }
+        let mut node = base;
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["totalCount"] =
+            0.into();
+        assert_eq!(
+            serde_json::from_value::<PrNode>(node).unwrap().ci_status(),
+            None
+        );
+    }
+
     #[tokio::test]
-    async fn polling_loop_refresh_triggers_early_poll() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::TcpListener;
-        use tokio::sync::oneshot;
-
+    async fn polling_ci_tracks_same_sha_reruns_without_rest_requests() {
+        use crate::types::CiStatus;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let server = MockServer::start().await;
-        let mut response = graphql_response_with_pr(1);
-        response["data"]["search"]["nodes"][0]["headRefOid"] = "sha".into();
+        let phase = Arc::new(AtomicUsize::new(0));
+        let response_phase = phase.clone();
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .and(wiremock::matchers::body_string_contains("search(query:"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert!(
+                    body["query"]
+                        .as_str()
+                        .unwrap()
+                        .contains("statusCheckRollup")
+                );
+                let phase = response_phase.load(Ordering::SeqCst);
+                let state = [
+                    Some("PENDING"),
+                    Some("SUCCESS"),
+                    Some("PENDING"),
+                    Some("FAILURE"),
+                    None,
+                ][phase];
+                ResponseTemplate::new(200).set_body_json(with_ci(
+                    graphql_response_with_pr(1),
+                    if phase == 4 { "new-sha" } else { "sha" },
+                    state,
+                ))
+            })
             .mount(&server)
             .await;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let gate_uri = format!("http://{}", listener.local_addr().unwrap());
-        let (gate_tx, mut gate_rx) = mpsc::channel::<oneshot::Sender<()>>(4);
-        let gate_handle =
-            tokio::spawn(async move {
-                let mut handlers = Vec::with_capacity(2);
-                for _ in 0..2 {
-                    let (stream, _) = listener.accept().await.unwrap();
-                    let gate_tx = gate_tx.clone();
-                    handlers.push(tokio::spawn(async move {
-                    let mut reader = BufReader::new(stream);
-                    loop {
-                        let mut line = String::new();
-                        let bytes = reader.read_line(&mut line).await.unwrap();
-                        if bytes == 0 || line == "\r\n" {
-                            break;
-                        }
-                    }
-                    let (release_tx, release_rx) = oneshot::channel();
-                    gate_tx.send(release_tx).await.unwrap();
-                    release_rx.await.unwrap();
-                    let body =
-                        r#"{"state":"success","statuses":[{}],"total_count":0,"check_runs":[]}"#;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    reader.into_inner().write_all(response.as_bytes()).await.unwrap();
-                }));
-                }
-                for handler in handlers {
-                    handler.await.unwrap();
-                }
-            });
-        Mock::given(method("GET"))
-            .and(wiremock::matchers::path_regex(
-                r"^/repos/org/repo/commits/[^/]+/(status|check-runs)$",
-            ))
-            .respond_with(ResponseTemplate::new(307).insert_header("Location", gate_uri))
-            .mount(&server)
-            .await;
-
-        let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::body_string_contains("reviewRequests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"repository": {"pullRequest": {
+                    "headRefOid":"sha", "updatedAt":"2024-01-01T00:00:00Z", "state":"OPEN", "isDraft":false,
+                    "author":{"login":"user"},
+                    "reviews":{"nodes":[], "pageInfo":{"hasNextPage":false,"endCursor":null}},
+                    "reviewRequests":{"nodes":[], "pageInfo":{"hasNextPage":false,"endCursor":null}}
+                }}}
+            }))).mount(&server).await;
+        let ctx = PollerContext {
+            clients: vec![GitHubClient::new_with_base_url(
+                "token".into(),
+                server.uri(),
+            )],
+            username: "user".into(),
+            interval: Duration::from_secs(3600),
+            dismiss_store: test_dismiss_store("graphql-ci"),
+        };
         let (tx, mut rx) = mpsc::channel(16);
-        let (err_tx, _err_rx) = mpsc::channel(16);
+        let (error_tx, _errors) = mpsc::channel(16);
         let (refresh_tx, refresh_rx) = mpsc::channel(1);
         let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-
-        let handle = tokio::spawn(async move {
-            polling_loop(
-                PollerContext {
-                    clients: vec![client],
-                    username: "user".to_string(),
-                    interval: Duration::from_secs(3600),
-                    dismiss_store: test_dismiss_store("refresh"),
-                },
-                tx,
-                err_tx,
-                cancel_clone,
-                refresh_rx,
-            )
-            .await;
-        });
-
-        let expected_id = PrId {
-            owner: "org".to_string(),
-            repo: "repo".to_string(),
-            number: 1,
-        };
-        let first = tokio::time::timeout(Duration::from_secs(10), recv_non_review(&mut rx))
-            .await
-            .expect("timeout waiting for first snapshot")
-            .expect("poll event channel closed");
-        let first_generation = match first {
-            PollEvent::Snapshot(payload) => {
-                let pr = payload.prs.get(&expected_id).expect("expected PR missing");
-                assert_eq!(pr.ci_status, None);
-                payload.generation
+        let handle = tokio::spawn(polling_loop(ctx, tx, error_tx, cancel.clone(), refresh_rx));
+        for (step, expected) in [
+            Some(CiStatus::Pending),
+            Some(CiStatus::Success),
+            Some(CiStatus::Pending),
+            Some(CiStatus::Failure),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if step > 0 {
+                phase.store(step, Ordering::SeqCst);
+                refresh_tx.send(()).await.unwrap();
             }
-            PollEvent::Ci(_) | PollEvent::Reviews(_) => panic!("CI arrived before first snapshot"),
-        };
-
-        for _ in 0..2 {
-            let release = tokio::time::timeout(Duration::from_secs(10), gate_rx.recv())
+            let snapshot = tokio::time::timeout(Duration::from_secs(5), recv_snapshot(&mut rx))
                 .await
-                .expect("timeout waiting for first-cycle CI request")
-                .expect("gate channel closed");
-            release.send(()).unwrap();
+                .unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(5), recv_non_review(&mut rx))
+                .await
+                .unwrap()
+                .unwrap();
+            let PollEvent::Ci(ci) = event else {
+                panic!("expected CI update after snapshot")
+            };
+            assert_eq!(ci.generation, snapshot.generation);
+            assert_eq!(ci.statuses.len(), 1);
+            let update = ci.statuses.values().next().unwrap();
+            assert_eq!(update.status, expected);
+            assert_eq!(update.head_sha, if step == 4 { "new-sha" } else { "sha" });
         }
-        let first_ci = tokio::time::timeout(Duration::from_secs(10), recv_non_review(&mut rx))
-            .await
-            .expect("timeout waiting for first CI event")
-            .expect("poll event channel closed");
-        match first_ci {
-            PollEvent::Ci(payload) => {
-                assert_eq!(payload.generation, first_generation);
-                assert_eq!(
-                    payload.statuses.get(&expected_id).unwrap().status,
-                    Some(crate::types::CiStatus::Success)
-                );
-            }
-            PollEvent::Snapshot(_) | PollEvent::Reviews(_) => {
-                panic!("CI event missing after first snapshot")
-            }
-        }
-
-        refresh_tx.send(()).await.unwrap();
-        let second = tokio::time::timeout(Duration::from_secs(10), recv_non_review(&mut rx))
-            .await
-            .expect("timeout waiting for refresh-triggered snapshot")
-            .expect("poll event channel closed");
-        let second_generation = match second {
-            PollEvent::Snapshot(payload) => {
-                let pr = payload.prs.get(&expected_id).expect("expected PR missing");
-                assert_eq!(pr.ci_status, None);
-                assert!(payload.generation > first_generation);
-                payload.generation
-            }
-            PollEvent::Ci(_) | PollEvent::Reviews(_) => {
-                panic!("CI arrived before refresh-triggered snapshot")
-            }
-        };
-
-        let second_ci = tokio::time::timeout(Duration::from_secs(10), recv_non_review(&mut rx))
-            .await
-            .expect("timeout waiting for second CI event")
-            .expect("poll event channel closed");
-        match second_ci {
-            PollEvent::Ci(payload) => {
-                assert_eq!(payload.generation, second_generation);
-                assert!(
-                    payload.statuses.is_empty(),
-                    "unchanged completed CI must be cached"
-                );
-            }
-            PollEvent::Snapshot(_) | PollEvent::Reviews(_) => {
-                panic!("CI event missing after second snapshot")
-            }
-        }
-
         cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(10), handle)
+        tokio::time::timeout(Duration::from_secs(5), handle)
             .await
-            .expect("timeout stopping polling loop")
-            .expect("polling loop task panicked");
-        tokio::time::timeout(Duration::from_secs(10), gate_handle)
-            .await
-            .expect("timeout stopping gate server")
-            .expect("gate server task panicked");
+            .unwrap()
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|r| r.method == "POST"));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| String::from_utf8_lossy(&r.body).contains("search(query:"))
+                .count(),
+            3 + 4 * 6
+        );
     }
 
     #[tokio::test]
@@ -1538,17 +1345,8 @@ mod tests {
             assert!(
                 fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &tx).await[&id].is_none()
             );
-            let ci = fetch_ci_statuses(
-                &states,
-                &owners,
-                &HashSet::from([id.clone()]),
-                shas.clone(),
-                None,
-            )
-            .await;
-            assert_eq!(ci.is_empty(), disabled);
         }
-        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

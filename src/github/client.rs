@@ -10,10 +10,8 @@ use serde_json::json;
 use super::limits::{Limits, SharedLimits, for_viewer};
 use crate::error::AppError;
 use crate::github::query::{self, SEARCH_PRS_QUERY};
-use crate::github::types::{
-    CheckRunsResponse, CombinedStatusResponse, GraphQlResponse, PrNode, RecentComment,
-};
-use crate::types::{CiStatus, PrId};
+use crate::github::types::{GraphQlResponse, PrNode, RecentComment};
+use crate::types::PrId;
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
 const PAGE_SIZE: u64 = 50;
@@ -36,7 +34,7 @@ struct RequestGate {
 }
 
 impl GitHubClient {
-    /// All clones share one request gate, including search, reviews and REST CI.
+    /// All clones share one request gate, including searches and review summaries.
     /// Keep the gate through body decoding so HTTP-200 GraphQL limits stop queued work.
     pub(super) async fn send_json<T: serde::de::DeserializeOwned>(
         &self,
@@ -362,67 +360,6 @@ impl GitHubClient {
         }
         Ok(result)
     }
-
-    /// Fetch the CI status for a commit by combining the legacy commit-status API
-    /// (`/repos/{owner}/{repo}/commits/{sha}/status`) and the check-runs API
-    /// (`/repos/{owner}/{repo}/commits/{sha}/check-runs`).
-    ///
-    /// Returns `None` when no CI is configured for the commit, when the SHA is empty,
-    /// or when the token lacks permission to read these endpoints (404/403). Other
-    /// errors propagate so they are visible to the caller.
-    pub async fn fetch_ci_status(
-        &self,
-        owner: &str,
-        repo: &str,
-        sha: &str,
-    ) -> Result<Option<CiStatus>, AppError> {
-        if sha.is_empty() {
-            return Ok(None);
-        }
-
-        let combined = self.fetch_combined_status(owner, repo, sha).await?;
-        let check_runs = self.fetch_check_runs(owner, repo, sha).await?;
-
-        Ok(compute_ci_status(combined.as_ref(), check_runs.as_ref()))
-    }
-
-    async fn fetch_combined_status(
-        &self,
-        owner: &str,
-        repo: &str,
-        sha: &str,
-    ) -> Result<Option<CombinedStatusResponse>, AppError> {
-        let url = format!(
-            "{}/repos/{}/{}/commits/{}/status",
-            self.api_base, owner, repo, sha
-        );
-        let request = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.token)
-            .header("Accept", "application/vnd.github+json");
-
-        self.send_json(request, true).await
-    }
-
-    async fn fetch_check_runs(
-        &self,
-        owner: &str,
-        repo: &str,
-        sha: &str,
-    ) -> Result<Option<CheckRunsResponse>, AppError> {
-        let url = format!(
-            "{}/repos/{}/{}/commits/{}/check-runs",
-            self.api_base, owner, repo, sha
-        );
-        let request = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.token)
-            .header("Accept", "application/vnd.github+json");
-
-        self.send_json(request, true).await
-    }
 }
 
 fn rate_limit_message(message: &str) -> bool {
@@ -430,56 +367,6 @@ fn rate_limit_message(message: &str) -> bool {
     message.contains("rate limit")
         || message.contains("rate_limit")
         || message.contains("abuse detection")
-}
-
-fn compute_ci_status(
-    combined: Option<&CombinedStatusResponse>,
-    check_runs: Option<&CheckRunsResponse>,
-) -> Option<CiStatus> {
-    let combined_present = combined.is_some_and(|c| !c.statuses.is_empty());
-    let check_runs_present = check_runs.is_some_and(|cr| cr.total_count > 0);
-    if !combined_present && !check_runs_present {
-        return None;
-    }
-
-    // Pending if any check run is not completed, or is waiting for user action
-    // (`action_required` completes the run but CI has not actually finished).
-    if let Some(cr) = check_runs {
-        for run in &cr.check_runs {
-            if run.status != "completed" || run.conclusion.as_deref() == Some("action_required") {
-                return Some(CiStatus::Pending);
-            }
-        }
-    }
-
-    // Pending if combined-status is still running.
-    if let Some(c) = combined
-        && combined_present
-        && c.state == "pending"
-    {
-        return Some(CiStatus::Pending);
-    }
-
-    // Failure if any check run failed (failure / cancelled / timed_out / startup_failure).
-    if let Some(cr) = check_runs {
-        for run in &cr.check_runs {
-            if matches!(
-                run.conclusion.as_deref(),
-                Some("failure" | "cancelled" | "timed_out" | "startup_failure")
-            ) {
-                return Some(CiStatus::Failure);
-            }
-        }
-    }
-
-    // Failure if combined-status failed/errored.
-    if let Some(c) = combined
-        && (c.state == "failure" || c.state == "error")
-    {
-        return Some(CiStatus::Failure);
-    }
-
-    Some(CiStatus::Success)
 }
 
 #[cfg(test)]
@@ -636,241 +523,26 @@ mod tests {
         assert_eq!(requests.len(), MAX_PAGES as usize);
     }
 
-    // --- fetch_ci_status ---
-
-    #[tokio::test]
-    async fn ci_status_empty_sha_returns_none() {
-        let server = MockServer::start().await;
-        let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.fetch_ci_status("o", "r", "").await.unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[tokio::test]
-    async fn ci_status_no_statuses_or_check_runs_returns_none() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "state": "pending",
-                "statuses": []
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/check-runs"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "total_count": 0,
-                "check_runs": []
-            })))
-            .mount(&server)
-            .await;
-
-        let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.fetch_ci_status("o", "r", "abc").await.unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[tokio::test]
-    async fn ci_status_pending_check_run_returns_pending() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "state": "success",
-                "statuses": []
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/check-runs"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "total_count": 2,
-                "check_runs": [
-                    {"status": "in_progress", "conclusion": null},
-                    {"status": "completed", "conclusion": "success"}
-                ]
-            })))
-            .mount(&server)
-            .await;
-
-        let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.fetch_ci_status("o", "r", "abc").await.unwrap();
-        assert_eq!(result, Some(CiStatus::Pending));
-    }
-
-    #[tokio::test]
-    async fn ci_status_all_completed_success_returns_success() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "state": "success",
-                "statuses": []
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/check-runs"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "total_count": 1,
-                "check_runs": [
-                    {"status": "completed", "conclusion": "success"}
-                ]
-            })))
-            .mount(&server)
-            .await;
-
-        let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.fetch_ci_status("o", "r", "abc").await.unwrap();
-        assert_eq!(result, Some(CiStatus::Success));
-    }
-
-    #[tokio::test]
-    async fn ci_status_failed_check_run_returns_failure() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "state": "success",
-                "statuses": []
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/check-runs"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "total_count": 1,
-                "check_runs": [
-                    {"status": "completed", "conclusion": "failure"}
-                ]
-            })))
-            .mount(&server)
-            .await;
-
-        let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.fetch_ci_status("o", "r", "abc").await.unwrap();
-        assert_eq!(result, Some(CiStatus::Failure));
-    }
-
-    #[tokio::test]
-    async fn ci_status_startup_failure_returns_failure() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "state": "success",
-                "statuses": []
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/check-runs"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "total_count": 1,
-                "check_runs": [
-                    {"status": "completed", "conclusion": "startup_failure"}
-                ]
-            })))
-            .mount(&server)
-            .await;
-
-        let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.fetch_ci_status("o", "r", "abc").await.unwrap();
-        assert_eq!(result, Some(CiStatus::Failure));
-    }
-
-    #[tokio::test]
-    async fn ci_status_action_required_returns_pending() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "state": "success",
-                "statuses": []
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/check-runs"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "total_count": 1,
-                "check_runs": [
-                    {"status": "completed", "conclusion": "action_required"}
-                ]
-            })))
-            .mount(&server)
-            .await;
-
-        let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.fetch_ci_status("o", "r", "abc").await.unwrap();
-        assert_eq!(result, Some(CiStatus::Pending));
-    }
-
-    #[tokio::test]
-    async fn ci_status_combined_failure_returns_failure() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "state": "failure",
-                "statuses": [{"state": "failure"}]
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/check-runs"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "total_count": 0,
-                "check_runs": []
-            })))
-            .mount(&server)
-            .await;
-
-        let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.fetch_ci_status("o", "r", "abc").await.unwrap();
-        assert_eq!(result, Some(CiStatus::Failure));
-    }
-
-    #[tokio::test]
-    async fn ci_status_403_on_check_runs_falls_back_to_combined_only() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "state": "success",
-                "statuses": [{"state": "success"}]
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/check-runs"))
-            .respond_with(ResponseTemplate::new(403))
-            .mount(&server)
-            .await;
-
-        let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.fetch_ci_status("o", "r", "abc").await.unwrap();
-        assert_eq!(result, Some(CiStatus::Success));
-    }
-
-    #[tokio::test]
-    async fn ci_status_404_on_both_returns_none() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/status"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/repos/o/r/commits/abc/check-runs"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-
-        let client = GitHubClient::new_with_base_url("token".to_string(), server.uri());
-        let result = client.fetch_ci_status("o", "r", "abc").await.unwrap();
-        assert_eq!(result, None);
+    // Exercise core-resource cooldowns directly, without a production REST CI path.
+    impl GitHubClient {
+        async fn test_core_requests(
+            &self,
+            owner: &str,
+            repo: &str,
+            sha: &str,
+        ) -> Result<Option<serde_json::Value>, AppError> {
+            for suffix in ["status", "check-runs"] {
+                let request = self
+                    .client
+                    .get(format!(
+                        "{}/repos/{owner}/{repo}/commits/{sha}/{suffix}",
+                        self.api_base
+                    ))
+                    .bearer_auth(&self.token);
+                self.send_json::<serde_json::Value>(request, true).await?;
+            }
+            Ok(None)
+        }
     }
 
     #[tokio::test]
@@ -891,7 +563,7 @@ mod tests {
             ));
             let clone = client.clone();
             assert!(matches!(
-                clone.fetch_ci_status("o", "r", "sha").await,
+                clone.test_core_requests("o", "r", "sha").await,
                 Err(AppError::RateLimited { .. })
             ));
             assert!(matches!(
@@ -931,7 +603,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = GitHubClient::new_with_base_url("token".into(), server.uri());
-        match client.fetch_ci_status("o", "r", "sha").await {
+        match client.test_core_requests("o", "r", "sha").await {
             Err(AppError::RateLimited {
                 retry_after_secs, ..
             }) => assert!(retry_after_secs > 3500),
@@ -939,7 +611,7 @@ mod tests {
         }
         assert!(client.search_prs("author:a", 1).await.is_ok());
         assert!(matches!(
-            client.fetch_ci_status("o", "r", "sha").await,
+            client.test_core_requests("o", "r", "sha").await,
             Err(AppError::RateLimited { .. })
         ));
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
@@ -1003,7 +675,10 @@ mod tests {
                 .await,
             Err(AppError::RateLimited { .. })
         ));
-        assert_eq!(client.fetch_ci_status("o", "r", "sha").await.unwrap(), None);
+        assert_eq!(
+            client.test_core_requests("o", "r", "sha").await.unwrap(),
+            None
+        );
         assert_eq!(server.received_requests().await.unwrap().len(), 3);
     }
 
@@ -1037,7 +712,7 @@ mod tests {
             client.search_prs("a", 1).await,
             Err(AppError::ServiceUnavailable { .. })
         ));
-        assert!(client.fetch_ci_status("o", "r", "sha").await.is_ok());
+        assert!(client.test_core_requests("o", "r", "sha").await.is_ok());
         assert_eq!(server.received_requests().await.unwrap().len(), 3);
         assert!(!client.gate.lock().await.disabled);
     }
@@ -1094,16 +769,16 @@ mod tests {
             client.search_prs("a", 1).await.unwrap();
         }
         assert!(matches!(
-            a.fetch_ci_status("o", "r", "sha").await,
+            a.test_core_requests("o", "r", "sha").await,
             Err(AppError::RateLimited { .. })
         ));
         assert!(matches!(
-            b.fetch_ci_status("o", "r", "sha").await,
+            b.test_core_requests("o", "r", "sha").await,
             Err(AppError::RateLimited { .. })
         ));
         assert_eq!(server.received_requests().await.unwrap().len(), 4);
         // The independent user's REST calls reach the server (404 is allowed).
-        assert!(c.fetch_ci_status("o", "r", "sha").await.is_ok());
+        assert!(c.test_core_requests("o", "r", "sha").await.is_ok());
         assert_eq!(server.received_requests().await.unwrap().len(), 6);
         assert!(b.search_prs("a", 1).await.is_ok());
     }

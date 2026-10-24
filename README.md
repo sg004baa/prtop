@@ -63,10 +63,10 @@ can also be supplied via CLI or environment variable:
 > Grant **read-only** permissions to every token. prtop never writes to GitHub.
 
 Every token needs these fine-grained permissions: **Pull requests: Read-only**
-and **Metadata: Read-only**. To populate CI status for PRs visible through a
-token, that same token also needs **Commit statuses: Read-only** and/or
-**Checks: Read-only**; without those permissions, CI calls silently return
-403/404 and the `CI` column shows `-` for those PRs.
+and **Metadata: Read-only**. CI visibility also depends on access to commit
+statuses and checks; grant **Commit statuses: Read-only** and **Checks: Read-only**
+for the repositories being monitored. GraphQL permission errors are reported
+rather than silently falling back to REST.
 
 ## Notifications
 
@@ -101,16 +101,18 @@ enabled = true
 | `pr_approved`         |    ✅    | All tracked reviewers approve your open, non-draft PR           |
 | `ci_finished`         |    ❌    | CI transitions from in-progress to success/failure (author only) |
 
-CI status is fetched for open PRs (per-PR REST calls to
-`/repos/{owner}/{repo}/commits/{sha}/status` and `/check-runs`) and shown in
-the `CI` column regardless of `ci_finished`. Each token needs the additional
-**Commit statuses: Read-only** and/or **Checks: Read-only** permissions;
-without them the calls return 403/404 silently and affected PRs show `-`.
+CI status comes from the head commit's GraphQL `statusCheckRollup`, included in
+normal PR searches. There are no per-PR REST status/check-runs requests and no
+separate CI polling timer. Refreshing searches observes CI changes even when the
+head SHA and PR timestamp have not changed (including workflow reruns).
 
-On startup and refresh, the PR list appears before CI fetching completes. The
-CI column updates afterward without moving your selection. While refreshing,
-the previous CI status is kept only when the PR still has the same head commit;
-new or changed commits show `-` until their CI status arrives.
+The `CI` column follows GitHub's aggregate state: `SUCCESS` is success,
+`FAILURE`/`ERROR` are failure, and `PENDING`/`EXPECTED` are in progress. Missing
+rollups, empty contexts, unknown states, or a mismatched head commit show `-`.
+This uses GitHub's aggregation rules instead of combining individual checks
+locally; mixed check outcomes and action-required checks may differ from the
+previous REST-based display. CI updates use the existing notification path.
+GraphQL query cost increases, so GraphQL rate limits can still require waiting.
 
 `ci_finished` controls only whether a *notification* fires when CI
 transitions from in-progress to success/failure. It defaults off because CI
@@ -149,8 +151,9 @@ approval notifications. A new head commit also marks the old count stale until
 its review fetch succeeds.
 
 Requests are serialized per token. Primary rate-limit cooldowns are tracked
-separately for GraphQL and REST (`core`), so exhausted CI quota does not stop PR
-searches, and cached PRs can still receive CI updates during a GraphQL cooldown.
+separately for GraphQL and REST (`core`). PR searches and CI now both use
+GraphQL, so a GraphQL cooldown pauses updates to both; REST quota is not consumed
+for CI.
 Secondary limits pause both resources. Requests queued during a cooldown are
 rejected locally without contacting GitHub. The client respects `Retry-After`
 and `x-ratelimit-reset`, with a 60-second fallback if the deadline is missing.
@@ -174,9 +177,8 @@ consumed that quota.
 
 On the initial successful load, only open-PR searches are performed (three
 searches per token before pagination, rather than six). Closed/merged searches
-resume on later polls to detect transitions of tracked PRs. Completed CI results
-are rechecked every five minutes; pending/unavailable CI at most once per minute,
-with head changes bypassing the cache.
+resume on later polls to detect transitions of tracked PRs. CI rollups refresh
+with these searches, including PRs without configured CI.
 
 `pr_approved` sends `PR approved` only when a previously observed incomplete
 review state becomes fully approved on your open, non-draft PR. The first

@@ -19,6 +19,7 @@ fn deserialize_search_response() {
 
     let first = &search.nodes[0];
     assert_eq!(first.number, 1234);
+    assert_eq!(first.ci_status(), Some(prtop::types::CiStatus::Success));
     assert_eq!(first.title, "Fix rendering bug");
     assert_eq!(first.state, "OPEN");
     assert!(!first.is_draft);
@@ -29,6 +30,7 @@ fn deserialize_search_response() {
 
     let second = &search.nodes[1];
     assert_eq!(second.number, 5678);
+    assert_eq!(second.ci_status(), None);
     assert!(second.is_draft);
     assert_eq!(second.review_decision, None);
 }
