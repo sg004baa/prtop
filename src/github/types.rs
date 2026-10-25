@@ -102,7 +102,7 @@ pub struct RepoOwnerNode {
 /// Only the last PR commit is requested; verify its OID before using its CI state.
 #[derive(Debug, Deserialize)]
 pub struct CommitConnection {
-    pub nodes: Vec<CommitNode>,
+    pub nodes: Option<Vec<Option<CommitNode>>>,
 }
 #[derive(Debug, Deserialize)]
 pub struct CommitNode {
@@ -122,7 +122,14 @@ pub struct StatusCheckRollup {
 impl PrNode {
     pub fn ci_status(&self) -> Option<crate::types::CiStatus> {
         use crate::types::CiStatus;
-        let commit = &self.commits.as_ref()?.nodes.last()?.commit;
+        let commit = &self
+            .commits
+            .as_ref()?
+            .nodes
+            .as_ref()?
+            .last()?
+            .as_ref()?
+            .commit;
         if self.head_ref_oid.is_empty() || commit.oid != self.head_ref_oid {
             return None;
         }

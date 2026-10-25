@@ -1126,7 +1126,12 @@ mod tests {
         }
         let response = with_ci(graphql_response_with_pr(1), "sha", Some("SUCCESS"));
         let base = response["data"]["search"]["nodes"][0].clone();
-        for replacement in [serde_json::Value::Null, serde_json::json!({"nodes": []})] {
+        for replacement in [
+            serde_json::Value::Null,
+            serde_json::json!({"nodes": []}),
+            serde_json::json!({"nodes": null}),
+            serde_json::json!({"nodes": [null]}),
+        ] {
             let mut node = base.clone();
             node["commits"] = replacement;
             assert_eq!(
