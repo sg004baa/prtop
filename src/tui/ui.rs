@@ -54,7 +54,7 @@ fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize, usize,
 
 fn pr_list_area(f: &Frame, app: &App) -> Rect {
     // fixed rows: app_header(1) + col_header(1) + blank(1) + footer(1) = 4
-    let fixed = 4 + error_banner_height(app);
+    let fixed = 4 + error_banner_height(app, f.area());
     let max_list_lines = f.area().height.saturating_sub(fixed).max(1);
     let list_lines = match &app.loading {
         LoadingState::Loaded => (app.visible_rows.len().max(1) as u16).min(max_list_lines),
@@ -66,57 +66,76 @@ fn pr_list_area(f: &Frame, app: &App) -> Rect {
 
 fn render_pr_list(f: &mut Frame, app: &mut App) {
     let area = pr_list_area(f, app);
-    let banner_height = error_banner_height(app);
+    let banner_height = error_banner_height(app, f.area());
     let list_lines = area.height.saturating_sub(4 + banner_height).max(1);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),             // app header
-            Constraint::Length(banner_height), // persistent API warning
             Constraint::Length(1),             // column header
             Constraint::Length(list_lines),    // pr list
             Constraint::Length(1),             // blank separator
             Constraint::Length(1),             // footer
+            Constraint::Length(banner_height), // multiline API warning below key hints
         ])
         .split(area);
 
     let widths = col_widths(area.width, app);
     render_header(f, app, chunks[0]);
-    render_api_warning(f, app, chunks[1]);
-    render_col_header(f, app, chunks[2], widths);
-    render_list(f, app, chunks[3], widths);
-    render_footer(f, app, chunks[5]);
+    render_col_header(f, app, chunks[1], widths);
+    render_list(f, app, chunks[2], widths);
+    render_footer(f, app, chunks[4]);
+    render_api_warning(f, app, chunks[5]);
 }
 
-fn error_banner_height(app: &App) -> u16 {
-    if app.last_api_error.is_some() { 3 } else { 0 }
+fn error_banner_height(app: &App, area: Rect) -> u16 {
+    warning_lines(app, area.width)
+        .len()
+        .min(area.height.saturating_sub(5) as usize) as u16
+}
+
+fn warning_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let Some(error) = &app.last_api_error else {
+        return Vec::new();
+    };
+    if width == 0 {
+        return Vec::new();
+    }
+    let title = if app.poll_error.is_some() {
+        "API warning - ?: details"
+    } else {
+        "Last API warning - ?: details (may have recovered)"
+    };
+    let mut lines = Vec::new();
+    // Preserve explicit newlines and indentation, wrapping long lines to the
+    // terminal width so the reserved height matches the rendered text.
+    for (index, source) in std::iter::once(title).chain(error.split('\n')).enumerate() {
+        let style = if index == 0 {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        let mut line = String::new();
+        let mut used = 0;
+        for ch in source.trim_end_matches('\r').chars() {
+            let size = ch.width().unwrap_or(0);
+            if used + size > width as usize && !line.is_empty() {
+                lines.push(Line::from(Span::styled(std::mem::take(&mut line), style)));
+                used = 0;
+            }
+            line.push(ch);
+            used += size;
+        }
+        lines.push(Line::from(Span::styled(line, style)));
+    }
+    lines
 }
 
 fn render_api_warning(f: &mut Frame, app: &App, area: Rect) {
-    let Some(error) = &app.last_api_error else {
-        return;
-    };
-    let title = if app.poll_error.is_some() {
-        " API warning - ?: details"
-    } else {
-        " Last API warning - ?: details (may have recovered)"
-    };
-    let lines = vec![
-        Line::from(Span::styled(
-            title,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(error.replace(['\n', '\r'], " ")),
-    ];
-    f.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().fg(Color::Yellow))
-            .wrap(Wrap { trim: true }),
-        area,
-    );
+    f.render_widget(Paragraph::new(warning_lines(app, area.width)), area);
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
@@ -189,9 +208,9 @@ fn render_list(
             f.render_widget(loading, area);
             return;
         }
-        LoadingState::Error(msg) => {
-            let error =
-                Paragraph::new(format!("  Error: {msg}")).style(Style::default().fg(Color::Red));
+        LoadingState::Error(_msg) => {
+            let error = Paragraph::new("  Unable to load PRs. See error below.")
+                .style(Style::default().fg(Color::Red));
             f.render_widget(error, area);
             return;
         }
@@ -311,13 +330,7 @@ fn render_list(
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let pr_count = app.prs.len();
 
-    let status = if let Some(ref msg) = app.status_message {
-        msg.clone()
-    } else if let Some(ref err) = app.poll_error {
-        format!("Error: {err}")
-    } else {
-        String::new()
-    };
+    let status = app.status_message.clone().unwrap_or_default();
 
     let footer = Line::from(vec![
         Span::styled(
@@ -606,10 +619,10 @@ mod tests {
             Default::default(),
         );
         app.update(Message::PollError(
-            "GitHub token #1: CI unavailable: permission denied".into(),
+            "GitHub token #1: CI unavailable\nHTTP 403\n  permission denied".into(),
         ));
         for width in [40, 80] {
-            let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
             for recovered in [false, true] {
                 if recovered {
                     app.update(Message::PollResult(PollPayload {
@@ -623,20 +636,22 @@ mod tests {
                 }
                 terminal.draw(|f| view(f, &mut app)).unwrap();
                 let buffer = terminal.backend().buffer();
-                let lines: Vec<String> = (0..12)
+                let lines: Vec<String> = (0..24)
                     .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
                     .collect();
                 let text = lines.join("\n");
                 assert!(text.contains("API warning"), "{text}");
                 assert!(text.contains("?: details"), "{text}");
                 assert!(text.contains("CI unavailable"), "{text}");
-                assert!(
-                    lines
-                        .iter()
-                        .position(|l| l.contains("API warning"))
-                        .unwrap()
-                        < 3
-                );
+                let hint_row = lines.iter().position(|l| l.contains("Enter:")).unwrap();
+                let warning_row = lines
+                    .iter()
+                    .position(|l| l.contains("API warning"))
+                    .unwrap();
+                assert!(warning_row > hint_row, "{text}");
+                let http_row = lines.iter().position(|l| l.trim() == "HTTP 403").unwrap();
+                assert_eq!(lines[http_row + 1].trim_end(), "  permission denied");
+                assert!(http_row > warning_row);
             }
         }
     }

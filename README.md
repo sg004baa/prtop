@@ -174,9 +174,10 @@ restarting prtop does not reset GitHub's quota.
 Rate-limit diagnostics show the HTTP status, endpoint path, resource, remaining
 quota and UTC reset timestamp, or `unknown` for missing headers. Cached cooldown
 errors retain the original response evidence. Press `?` to inspect the last API
-error in the help screen. A dedicated warning banner also remains above the PR
-list after snapshots or manual refreshes, so an error cannot disappear before
-being noticed. Historical warnings are labelled as possibly recovered. Credentials and request bodies
+error in the help screen. A dedicated multiline warning remains below the key
+hints after snapshots or manual refreshes. It preserves message line breaks and
+wraps long lines so an error cannot disappear before being noticed. Historical
+warnings are labelled as possibly recovered. Credentials and request bodies
 are excluded from this diagnostic. An actual exhausted primary quota still needs
 to wait for its reset; a long countdown alone does not prove the current process
 consumed that quota.
