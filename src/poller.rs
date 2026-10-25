@@ -375,6 +375,11 @@ pub async fn polling_loop(
                 let Ok((i, result)) = joined else { continue };
                 match result {
                     Ok(raw) => {
+                        if let Some(warning) = states[i].client.ci_warning().await {
+                            let _ = error_tx
+                                .send(format!("GitHub token #{}: {warning}", i + 1))
+                                .await;
+                        }
                         states[i].cache = Some(raw);
                         states[i].backoff_secs = 0;
                         states[i].retrying = false;

@@ -54,35 +54,69 @@ fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize, usize,
 
 fn pr_list_area(f: &Frame, app: &App) -> Rect {
     // fixed rows: app_header(1) + col_header(1) + blank(1) + footer(1) = 4
-    let max_list_lines = f.area().height.saturating_sub(4).max(1);
+    let fixed = 4 + error_banner_height(app);
+    let max_list_lines = f.area().height.saturating_sub(fixed).max(1);
     let list_lines = match &app.loading {
         LoadingState::Loaded => (app.visible_rows.len().max(1) as u16).min(max_list_lines),
         _ => 1,
     };
-    let height = (list_lines + 4).min(f.area().height);
+    let height = (list_lines + fixed).min(f.area().height);
     Rect::new(0, 0, f.area().width, height)
 }
 
 fn render_pr_list(f: &mut Frame, app: &mut App) {
     let area = pr_list_area(f, app);
-    let list_lines = area.height.saturating_sub(4).max(1); // subtract fixed rows
+    let banner_height = error_banner_height(app);
+    let list_lines = area.height.saturating_sub(4 + banner_height).max(1);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),          // app header
-            Constraint::Length(1),          // column header
-            Constraint::Length(list_lines), // pr list
-            Constraint::Length(1),          // blank separator
-            Constraint::Length(1),          // footer
+            Constraint::Length(1),             // app header
+            Constraint::Length(banner_height), // persistent API warning
+            Constraint::Length(1),             // column header
+            Constraint::Length(list_lines),    // pr list
+            Constraint::Length(1),             // blank separator
+            Constraint::Length(1),             // footer
         ])
         .split(area);
 
     let widths = col_widths(area.width, app);
     render_header(f, app, chunks[0]);
-    render_col_header(f, app, chunks[1], widths);
-    render_list(f, app, chunks[2], widths);
-    render_footer(f, app, chunks[4]);
+    render_api_warning(f, app, chunks[1]);
+    render_col_header(f, app, chunks[2], widths);
+    render_list(f, app, chunks[3], widths);
+    render_footer(f, app, chunks[5]);
+}
+
+fn error_banner_height(app: &App) -> u16 {
+    if app.last_api_error.is_some() { 3 } else { 0 }
+}
+
+fn render_api_warning(f: &mut Frame, app: &App, area: Rect) {
+    let Some(error) = &app.last_api_error else {
+        return;
+    };
+    let title = if app.poll_error.is_some() {
+        " API warning - ?: details"
+    } else {
+        " Last API warning - ?: details (may have recovered)"
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(error.replace(['\n', '\r'], " ")),
+    ];
+    f.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(Color::Yellow))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
@@ -95,7 +129,11 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         })
         .unwrap_or_else(|| "---".to_string());
 
-    let error_indicator = if app.poll_error.is_some() { " [!]" } else { "" };
+    let error_indicator = if app.last_api_error.is_some() {
+        " [!]"
+    } else {
+        ""
+    };
 
     let header = Line::from(vec![
         Span::styled(
@@ -553,6 +591,53 @@ mod tests {
             assert!(label.contains(if width < 100 { "~" } else { "(stale)" }));
             assert_eq!(style.fg, Some(Color::DarkGray));
             assert!(label.contains("1/2"));
+        }
+    }
+
+    #[test]
+    fn list_keeps_warning_visible_after_snapshot_and_during_refresh() {
+        use crate::app::Message;
+        use crate::poller::PollPayload;
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = App::new(
+            "me".into(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        app.update(Message::PollError(
+            "GitHub token #1: CI unavailable: permission denied".into(),
+        ));
+        for width in [40, 80] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+            for recovered in [false, true] {
+                if recovered {
+                    app.update(Message::PollResult(PollPayload {
+                        generation: 1,
+                        prs: Default::default(),
+                        head_shas: Default::default(),
+                        polled_at: chrono::Utc::now(),
+                    }));
+                    assert!(matches!(app.loading, LoadingState::Loaded));
+                    app.status_message = Some("Refreshing...".into());
+                }
+                terminal.draw(|f| view(f, &mut app)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let lines: Vec<String> = (0..12)
+                    .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+                    .collect();
+                let text = lines.join("\n");
+                assert!(text.contains("API warning"), "{text}");
+                assert!(text.contains("?: details"), "{text}");
+                assert!(text.contains("CI unavailable"), "{text}");
+                assert!(
+                    lines
+                        .iter()
+                        .position(|l| l.contains("API warning"))
+                        .unwrap()
+                        < 3
+                );
+            }
         }
     }
 

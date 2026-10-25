@@ -65,8 +65,13 @@ can also be supplied via CLI or environment variable:
 Every token needs these fine-grained permissions: **Pull requests: Read-only**
 and **Metadata: Read-only**. CI visibility also depends on access to commit
 statuses and checks; grant **Commit statuses: Read-only** and **Checks: Read-only**
-for the repositories being monitored. GraphQL permission errors are reported
-rather than silently falling back to REST.
+for the repositories being monitored. If GraphQL reports a permission error,
+prtop retries the same search once with
+CI fields excluded. If that succeeds, PR monitoring continues with CI shown as
+`-` for that token until restart, and a warning explains the missing capability.
+Check repository access and Contents/Commit statuses/Checks read permissions;
+after updating permissions, restart prtop to retry CI. No REST fallback is used.
+Permission errors that remain without CI still fail the search.
 
 ## Notifications
 
@@ -169,8 +174,9 @@ restarting prtop does not reset GitHub's quota.
 Rate-limit diagnostics show the HTTP status, endpoint path, resource, remaining
 quota and UTC reset timestamp, or `unknown` for missing headers. Cached cooldown
 errors retain the original response evidence. Press `?` to inspect the last API
-error in the help screen, even after a subsequent successful poll clears the
-footer warning. Credentials and request bodies
+error in the help screen. A dedicated warning banner also remains above the PR
+list after snapshots or manual refreshes, so an error cannot disappear before
+being noticed. Historical warnings are labelled as possibly recovered. Credentials and request bodies
 are excluded from this diagnostic. An actual exhausted primary quota still needs
 to wait for its reset; a long countdown alone does not prove the current process
 consumed that quota.

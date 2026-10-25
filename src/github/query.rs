@@ -1,5 +1,5 @@
 pub const SEARCH_PRS_QUERY: &str = r#"
-query($query: String!, $first: Int!, $after: String) {
+query($query: String!, $first: Int!, $after: String, $includeCI: Boolean!) {
   viewer { id }
   search(query: $query, type: ISSUE, first: $first, after: $after) {
     issueCount
@@ -18,7 +18,7 @@ query($query: String!, $first: Int!, $after: String) {
         updatedAt
         reviewDecision
         headRefOid
-        commits(last: 1) {
+        commits(last: 1) @include(if: $includeCI) {
           nodes {
             commit {
               oid

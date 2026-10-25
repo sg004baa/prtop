@@ -31,6 +31,8 @@ struct RequestGate {
     services: Limits,
     viewer: Option<String>,
     disabled: bool,
+    ci_disabled: bool,
+    ci_warning: Option<String>,
 }
 
 impl GitHubClient {
@@ -235,6 +237,10 @@ impl GitHubClient {
         }
     }
 
+    pub async fn ci_warning(&self) -> Option<String> {
+        self.gate.lock().await.ci_warning.clone()
+    }
+
     pub async fn search_prs(
         &self,
         search_query: &str,
@@ -245,32 +251,66 @@ impl GitHubClient {
         let url = format!("{}/graphql", self.api_base);
 
         for _ in 0..max_pages {
-            let variables = json!({
-                "query": search_query,
-                "first": PAGE_SIZE,
-                "after": cursor,
-            });
-
-            let body = json!({
-                "query": SEARCH_PRS_QUERY,
-                "variables": variables,
-            });
-
-            let request = self.client.post(&url).bearer_auth(&self.token).json(&body);
-
-            let gql_response: GraphQlResponse = self
-                .send_json(request, false)
-                .await?
-                .ok_or_else(|| AppError::GraphQl("Missing response".into()))?;
-
-            if let Some(errors) = gql_response.errors {
-                let msgs: Vec<String> = errors.into_iter().map(|e| e.message).collect();
-                return Err(AppError::GraphQl(msgs.join("; ")));
-            }
-
-            let data = gql_response
-                .data
-                .ok_or_else(|| AppError::GraphQl("No data in response".to_string()))?;
+            // Retry the same page once without optional CI fields on a permission
+            // error. Inspect errors before typed decoding: denied fields may null
+            // their parent objects, making an otherwise useful response unparseable.
+            let data = loop {
+                let include_ci = !self.gate.lock().await.ci_disabled;
+                let variables = json!({
+                    "query": search_query,
+                    "first": PAGE_SIZE,
+                    "after": cursor,
+                    "includeCI": include_ci,
+                });
+                let body = json!({"query": SEARCH_PRS_QUERY, "variables": variables});
+                let request = self.client.post(&url).bearer_auth(&self.token).json(&body);
+                let value: serde_json::Value = self
+                    .send_json(request, false)
+                    .await?
+                    .ok_or_else(|| AppError::GraphQl("Missing response".into()))?;
+                if let Some(errors) = value.get("errors").and_then(|v| v.as_array())
+                    && !errors.is_empty()
+                {
+                    let permission_only = errors.iter().all(|e| {
+                        e.get("type").and_then(|v| v.as_str()) == Some("FORBIDDEN")
+                            || e.get("message").and_then(|v| v.as_str()).is_some_and(|m| {
+                                m.contains("Resource not accessible by personal access token")
+                            })
+                    });
+                    if include_ci && permission_only {
+                        self.gate.lock().await.ci_disabled = true;
+                        continue;
+                    }
+                    let mut messages = Vec::new();
+                    for error in errors {
+                        let message = error
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Unknown GraphQL error");
+                        if !messages.contains(&message) {
+                            messages.push(message);
+                        }
+                    }
+                    return Err(AppError::GraphQl(messages.join("; ")));
+                }
+                let response: GraphQlResponse = serde_json::from_value(value)
+                    .map_err(|e| AppError::GraphQl(format!("Invalid API response: {e}")))?;
+                debug_assert!(
+                    response
+                        .errors
+                        .as_ref()
+                        .is_none_or(|errors| errors.is_empty())
+                );
+                let data = response
+                    .data
+                    .ok_or_else(|| AppError::GraphQl("No data in response".into()))?;
+                if !include_ci {
+                    self.gate.lock().await.ci_warning = Some(
+                        "CI unavailable: token cannot access CI fields. PR list continues without CI; check repository access and Contents/Commit statuses/Checks read permissions, then restart prtop to retry CI.".into()
+                    );
+                }
+                break data;
+            };
 
             let search = data.search;
             all_nodes.extend(search.nodes);
@@ -397,6 +437,108 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[tokio::test]
+    async fn forbidden_ci_retries_same_page_and_disables_ci_for_token_clones() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["variables"]["includeCI"] == true {
+                    // Decode errors before data: a denied field can null a parent.
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "data": {"search": null},
+                        "errors": [{"type":"FORBIDDEN", "message":"Resource not accessible by personal access token"}]
+                    }))
+                } else {
+                    let mut response: serde_json::Value = serde_json::from_str(include_str!("../../tests/fixtures/search_response.json")).unwrap();
+                    for node in response["data"]["search"]["nodes"].as_array_mut().unwrap() {
+                        node.as_object_mut().unwrap().remove("commits");
+                    }
+                    ResponseTemplate::new(200).set_body_json(response)
+                }
+            }).mount(&server).await;
+        let client = GitHubClient::new_with_base_url("token".into(), server.uri());
+        let prs = client.search_prs("author:me", 1).await.unwrap();
+        assert_eq!(prs.len(), 2);
+        assert!(prs.iter().all(|pr| pr.ci_status().is_none()));
+        assert!(
+            client
+                .ci_warning()
+                .await
+                .unwrap()
+                .contains("CI unavailable")
+        );
+        assert!(
+            client
+                .clone()
+                .search_prs("review-requested:me", 1)
+                .await
+                .is_ok()
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        let bodies: Vec<serde_json::Value> = requests
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(
+            bodies[0]["variables"]["query"],
+            bodies[1]["variables"]["query"]
+        );
+        assert_eq!(
+            bodies[0]["variables"]["after"],
+            bodies[1]["variables"]["after"]
+        );
+        assert_eq!(bodies[2]["variables"]["includeCI"], false);
+        assert!(
+            bodies[0]["query"]
+                .as_str()
+                .unwrap()
+                .contains("@include(if: $includeCI)")
+        );
+        // Another token retains its CI capability.
+        let other = GitHubClient::new_with_base_url("other".into(), server.uri());
+        assert!(!other.gate.lock().await.ci_disabled);
+    }
+
+    #[tokio::test]
+    async fn base_permission_errors_remain_fatal_and_are_deduplicated() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": null,
+            "errors": [
+                {"type":"FORBIDDEN", "message":"Resource not accessible by personal access token"},
+                {"type":"FORBIDDEN", "message":"Resource not accessible by personal access token"}
+            ]
+        }))).mount(&server).await;
+        let client = GitHubClient::new_with_base_url("token".into(), server.uri());
+        let error = client
+            .search_prs("author:me", 4)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error.matches("Resource not accessible").count(), 1);
+        assert!(client.ci_warning().await.is_none());
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        assert!(client.search_prs("author:me", 4).await.is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn non_permission_errors_do_not_disable_ci_or_trigger_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": null, "errors": [{"message":"Something went wrong"}]
+            })))
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new_with_base_url("token".into(), server.uri());
+        assert!(client.search_prs("author:me", 4).await.is_err());
+        assert!(!client.gate.lock().await.ci_disabled);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

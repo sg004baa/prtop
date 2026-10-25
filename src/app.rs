@@ -364,9 +364,8 @@ impl App {
                 self.poll_error = None;
                 self.status_message = None;
 
-                if matches!(self.loading, LoadingState::Initial | LoadingState::Loading) {
-                    self.loading = LoadingState::Loaded;
-                }
+                // A successful snapshot also recovers an initial error/warning.
+                self.loading = LoadingState::Loaded;
                 self.dirty = true;
             }
             Message::ReviewResult(payload) => {
