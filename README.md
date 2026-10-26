@@ -162,7 +162,12 @@ for CI.
 Secondary limits pause both resources. Requests queued during a cooldown are
 rejected locally without contacting GitHub. The client respects `Retry-After`
 and `x-ratelimit-reset`, with a 60-second fallback if the deadline is missing.
-A `503` with `Retry-After` is a temporary service failure, not a rate-limit error.
+All HTTP 5xx responses are temporary service failures, not GraphQL or rate-limit
+errors. They pause the affected API resource for `Retry-After`, or 60 seconds
+when it is missing. Warnings show the HTTP status, endpoint and retry delay;
+HTML/response bodies are never included. Authentication/permission HTTP errors,
+other HTTP errors, non-JSON responses and invalid JSON structures have separate
+messages. JSON GraphQL errors still report the API's error messages.
 
 Tokens belonging to the same GitHub user share primary quotas. prtop learns
 `viewer.id` from normal search responses (without an additional request) and

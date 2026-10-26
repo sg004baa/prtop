@@ -20,6 +20,12 @@ pub enum AppError {
     #[error("Authentication error: {0}")]
     Auth(String),
 
+    #[error("GitHub HTTP error: {0}")]
+    Http(String),
+
+    #[error("Invalid GitHub response: {0}")]
+    InvalidResponse(String),
+
     #[error("GraphQL error: {0}")]
     GraphQl(String),
 

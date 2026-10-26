@@ -90,6 +90,15 @@ impl GitHubClient {
             .filter(|r| matches!(*r, "core" | "graphql" | "search"))
             .unwrap_or(resource)
             .to_string();
+        // Upstream/proxy failures often contain an entire HTML error page. Do
+        // not read or expose it; classify by status and respect the retry header.
+        let http_details = format!("HTTP {status}; endpoint={endpoint}");
+        if status.is_server_error() {
+            let cooldown = gate
+                .services
+                .record(resource, retry.unwrap_or(60), http_details, true);
+            return Err(cooldown.error().expect("new cooldown"));
+        }
         let exhausted = remaining == Some(0);
         let body = response.text().await?;
         let value = serde_json::from_str::<serde_json::Value>(&body);
@@ -136,7 +145,7 @@ impl GitHubClient {
                 .ok()
                 .and_then(|v| v.get("message"))
                 .and_then(|m| m.as_str())
-                .unwrap_or(&body)
+                .unwrap_or_default()
                 .to_string()
         };
         let lower = error_text.to_ascii_lowercase();
@@ -160,14 +169,6 @@ impl GitHubClient {
                     .unwrap_or_else(|| "unknown".into())
             )
         };
-        if status.is_server_error()
-            && let Some(seconds) = retry
-        {
-            let cooldown =
-                gate.services
-                    .record(resource, seconds, diagnostic("service unavailable"), true);
-            return Err(cooldown.error().expect("new cooldown"));
-        }
         if limited || (status.is_success() && exhausted) {
             // Unknown 403/429 limits are conservatively shared; GraphQL RATE_LIMITED
             // without secondary evidence applies to its own primary bucket.
@@ -198,18 +199,19 @@ impl GitHubClient {
         }
         if status.as_u16() == 401 || (status.as_u16() == 403 && !allow_missing) {
             gate.disabled = true;
-            return Err(AppError::Auth(format!("{status}: {body}")));
+            return Err(AppError::Auth(http_details));
         }
         if allow_missing && matches!(status.as_u16(), 403 | 404) {
             return Ok(None);
         }
         if !status.is_success() {
-            return Err(AppError::GraphQl(format!("{status}: {body}")));
+            return Err(AppError::Http(http_details));
         }
-        let value = value.map_err(|e| AppError::GraphQl(format!("Invalid JSON response: {e}")))?;
-        serde_json::from_value(value)
-            .map(Some)
-            .map_err(|e| AppError::GraphQl(format!("Invalid API response: {e}")))
+        let value = value
+            .map_err(|_| AppError::InvalidResponse(format!("Expected JSON; {http_details}")))?;
+        serde_json::from_value(value).map(Some).map_err(|_| {
+            AppError::InvalidResponse(format!("Unexpected JSON structure; {http_details}"))
+        })
     }
 
     pub fn new(token: String) -> Self {
@@ -293,8 +295,11 @@ impl GitHubClient {
                     }
                     return Err(AppError::GraphQl(messages.join("; ")));
                 }
-                let response: GraphQlResponse = serde_json::from_value(value)
-                    .map_err(|e| AppError::GraphQl(format!("Invalid API response: {e}")))?;
+                let response: GraphQlResponse = serde_json::from_value(value).map_err(|_| {
+                    AppError::InvalidResponse(
+                        "Unexpected PR search JSON structure; endpoint=/graphql".into(),
+                    )
+                })?;
                 debug_assert!(
                     response
                         .errors
@@ -437,6 +442,81 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[tokio::test]
+    async fn server_errors_hide_bodies_and_pause_requests_without_disabling_token() {
+        for status in [500, 502, 503, 504] {
+            for retry in [None, Some("12")] {
+                let server = MockServer::start().await;
+                let mut response = ResponseTemplate::new(status)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string(
+                        "<!DOCTYPE html><html><style>raw-secret-marker</style></html>",
+                    );
+                if let Some(seconds) = retry {
+                    response = response.insert_header("retry-after", seconds);
+                }
+                Mock::given(method("POST"))
+                    .respond_with(response)
+                    .mount(&server)
+                    .await;
+                let client = GitHubClient::new_with_base_url("token".into(), server.uri());
+                let error = client.search_prs("author:me", 1).await.unwrap_err();
+                let AppError::ServiceUnavailable {
+                    retry_after_secs, ..
+                } = &error
+                else {
+                    panic!("{error}")
+                };
+                assert_eq!(*retry_after_secs, if retry.is_some() { 12 } else { 60 });
+                let text = error.to_string();
+                assert!(text.contains(&format!("HTTP {status}")));
+                assert!(text.contains("endpoint=/graphql"));
+                assert!(!text.contains("html") && !text.contains("raw-secret-marker"));
+                assert!(!client.gate.lock().await.disabled);
+                assert!(matches!(
+                    client.clone().search_prs("author:me", 1).await,
+                    Err(AppError::ServiceUnavailable { .. })
+                ));
+                assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn http_and_invalid_responses_never_display_raw_bodies() {
+        for status in [200, 401, 403, 404, 422] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_string("<html>raw-secret-marker</html>"),
+                )
+                .mount(&server)
+                .await;
+            let client = GitHubClient::new_with_base_url("token".into(), server.uri());
+            let error = client.search_prs("author:me", 1).await.unwrap_err();
+            match status {
+                200 => assert!(matches!(error, AppError::InvalidResponse(_))),
+                401 | 403 => assert!(matches!(error, AppError::Auth(_))),
+                _ => assert!(matches!(error, AppError::Http(_))),
+            }
+            let text = error.to_string();
+            assert!(text.contains(&format!("HTTP {status}")));
+            assert!(!text.contains("html") && !text.contains("raw-secret-marker"));
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data":"<html>raw-secret-marker</html>"})),
+            )
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new_with_base_url("token".into(), server.uri());
+        let error = client.search_prs("author:me", 1).await.unwrap_err();
+        assert!(matches!(error, AppError::InvalidResponse(_)));
+        assert!(!error.to_string().contains("raw-secret-marker"));
     }
 
     #[tokio::test]
