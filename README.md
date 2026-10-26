@@ -63,10 +63,15 @@ can also be supplied via CLI or environment variable:
 > Grant **read-only** permissions to every token. prtop never writes to GitHub.
 
 Every token needs these fine-grained permissions: **Pull requests: Read-only**
-and **Metadata: Read-only**. To populate CI status for PRs visible through a
-token, that same token also needs **Commit statuses: Read-only** and/or
-**Checks: Read-only**; without those permissions, CI calls silently return
-403/404 and the `CI` column shows `-` for those PRs.
+and **Metadata: Read-only**. CI visibility also depends on access to commit
+statuses and checks; grant **Commit statuses: Read-only** and **Checks: Read-only**
+for the repositories being monitored. If GraphQL reports a permission error,
+prtop retries the same search once with
+CI fields excluded. If that succeeds, PR monitoring continues with CI shown as
+`-` for that token until restart, and a warning explains the missing capability.
+Check repository access and Contents/Commit statuses/Checks read permissions;
+after updating permissions, restart prtop to retry CI. No REST fallback is used.
+Permission errors that remain without CI still fail the search.
 
 ## Notifications
 
@@ -101,16 +106,18 @@ enabled = true
 | `pr_approved`         |    ✅    | All tracked reviewers approve your open, non-draft PR           |
 | `ci_finished`         |    ❌    | CI transitions from in-progress to success/failure (author only) |
 
-CI status is fetched for open PRs (per-PR REST calls to
-`/repos/{owner}/{repo}/commits/{sha}/status` and `/check-runs`) and shown in
-the `CI` column regardless of `ci_finished`. Each token needs the additional
-**Commit statuses: Read-only** and/or **Checks: Read-only** permissions;
-without them the calls return 403/404 silently and affected PRs show `-`.
+CI status comes from the head commit's GraphQL `statusCheckRollup`, included in
+normal PR searches. There are no per-PR REST status/check-runs requests and no
+separate CI polling timer. Refreshing searches observes CI changes even when the
+head SHA and PR timestamp have not changed (including workflow reruns).
 
-On startup and refresh, the PR list appears before CI fetching completes. The
-CI column updates afterward without moving your selection. While refreshing,
-the previous CI status is kept only when the PR still has the same head commit;
-new or changed commits show `-` until their CI status arrives.
+The `CI` column follows GitHub's aggregate state: `SUCCESS` is success,
+`FAILURE`/`ERROR` are failure, and `PENDING`/`EXPECTED` are in progress. Missing
+rollups, empty contexts, unknown states, or a mismatched head commit show `-`.
+This uses GitHub's aggregation rules instead of combining individual checks
+locally; mixed check outcomes and action-required checks may differ from the
+previous REST-based display. CI updates use the existing notification path.
+GraphQL query cost increases, so GraphQL rate limits can still require waiting.
 
 `ci_finished` controls only whether a *notification* fires when CI
 transitions from in-progress to success/failure. It defaults off because CI
@@ -148,13 +155,42 @@ is used only when no complete count is available. Stale counts cannot generate
 approval notifications. A new head commit also marks the old count stale until
 its review fetch succeeds.
 
-Search, review, mention and CI requests share a per-token request gate. Requests
-are serialized per token, and HTTP 429/403 or GraphQL rate-limit errors stop
-queued requests until Retry-After / rate-limit reset (or a 60-second fallback).
-Failed authentication disables that token. Review/CI errors identify the token
-number and PR without displaying token values. Completed CI results are rechecked
-every five minutes; pending/unavailable CI is checked at most once per minute,
-with head changes bypassing the cache.
+Requests are serialized per token. Primary rate-limit cooldowns are tracked
+separately for GraphQL and REST (`core`). PR searches and CI now both use
+GraphQL, so a GraphQL cooldown pauses updates to both; REST quota is not consumed
+for CI.
+Secondary limits pause both resources. Requests queued during a cooldown are
+rejected locally without contacting GitHub. The client respects `Retry-After`
+and `x-ratelimit-reset`, with a 60-second fallback if the deadline is missing.
+All HTTP 5xx responses are temporary service failures, not GraphQL or rate-limit
+errors. They pause the affected API resource for `Retry-After`, or 60 seconds
+when it is missing. Warnings show the HTTP status, endpoint and retry delay;
+HTML/response bodies are never included. Authentication/permission HTTP errors,
+other HTTP errors, non-JSON responses and invalid JSON structures have separate
+messages. JSON GraphQL errors still report the API's error messages.
+
+Tokens belonging to the same GitHub user share primary quotas. prtop learns
+`viewer.id` from normal search responses (without an additional request) and
+shares observed cooldowns between tokens with the same verified user ID and API
+host. Tokens whose identity is not yet available remain separate, and different
+users are never grouped based on the configured username. State is in memory;
+restarting prtop does not reset GitHub's quota.
+
+Rate-limit diagnostics show the HTTP status, endpoint path, resource, remaining
+quota and UTC reset timestamp, or `unknown` for missing headers. Cached cooldown
+errors retain the original response evidence. Press `?` to inspect the last API
+error in the help screen. A dedicated multiline warning remains below the key
+hints after snapshots or manual refreshes. It preserves message line breaks and
+wraps long lines so an error cannot disappear before being noticed. Historical
+warnings are labelled as possibly recovered. Credentials and request bodies
+are excluded from this diagnostic. An actual exhausted primary quota still needs
+to wait for its reset; a long countdown alone does not prove the current process
+consumed that quota.
+
+On the initial successful load, only open-PR searches are performed (three
+searches per token before pagination, rather than six). Closed/merged searches
+resume on later polls to detect transitions of tracked PRs. CI rollups refresh
+with these searches, including PRs without configured CI.
 
 `pr_approved` sends `PR approved` only when a previously observed incomplete
 review state becomes fully approved on your open, non-draft PR. The first

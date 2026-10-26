@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, HighlightSpacing, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, HighlightSpacing, List, ListItem, Paragraph, Wrap};
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -54,27 +54,30 @@ fn col_widths(term_width: u16, app: &App) -> (usize, usize, usize, usize, usize,
 
 fn pr_list_area(f: &Frame, app: &App) -> Rect {
     // fixed rows: app_header(1) + col_header(1) + blank(1) + footer(1) = 4
-    let max_list_lines = f.area().height.saturating_sub(4).max(1);
+    let fixed = 4 + error_banner_height(app, f.area());
+    let max_list_lines = f.area().height.saturating_sub(fixed).max(1);
     let list_lines = match &app.loading {
         LoadingState::Loaded => (app.visible_rows.len().max(1) as u16).min(max_list_lines),
         _ => 1,
     };
-    let height = (list_lines + 4).min(f.area().height);
+    let height = (list_lines + fixed).min(f.area().height);
     Rect::new(0, 0, f.area().width, height)
 }
 
 fn render_pr_list(f: &mut Frame, app: &mut App) {
     let area = pr_list_area(f, app);
-    let list_lines = area.height.saturating_sub(4).max(1); // subtract fixed rows
+    let banner_height = error_banner_height(app, f.area());
+    let list_lines = area.height.saturating_sub(4 + banner_height).max(1);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),          // app header
-            Constraint::Length(1),          // column header
-            Constraint::Length(list_lines), // pr list
-            Constraint::Length(1),          // blank separator
-            Constraint::Length(1),          // footer
+            Constraint::Length(1),             // app header
+            Constraint::Length(1),             // column header
+            Constraint::Length(list_lines),    // pr list
+            Constraint::Length(1),             // blank separator
+            Constraint::Length(1),             // footer
+            Constraint::Length(banner_height), // multiline API warning below key hints
         ])
         .split(area);
 
@@ -83,6 +86,56 @@ fn render_pr_list(f: &mut Frame, app: &mut App) {
     render_col_header(f, app, chunks[1], widths);
     render_list(f, app, chunks[2], widths);
     render_footer(f, app, chunks[4]);
+    render_api_warning(f, app, chunks[5]);
+}
+
+fn error_banner_height(app: &App, area: Rect) -> u16 {
+    warning_lines(app, area.width)
+        .len()
+        .min(area.height.saturating_sub(5) as usize) as u16
+}
+
+fn warning_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let Some(error) = &app.last_api_error else {
+        return Vec::new();
+    };
+    if width == 0 {
+        return Vec::new();
+    }
+    let title = if app.poll_error.is_some() {
+        "API warning - ?: details"
+    } else {
+        "Last API warning - ?: details (may have recovered)"
+    };
+    let mut lines = Vec::new();
+    // Preserve explicit newlines and indentation, wrapping long lines to the
+    // terminal width so the reserved height matches the rendered text.
+    for (index, source) in std::iter::once(title).chain(error.split('\n')).enumerate() {
+        let style = if index == 0 {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        let mut line = String::new();
+        let mut used = 0;
+        for ch in source.trim_end_matches('\r').chars() {
+            let size = ch.width().unwrap_or(0);
+            if used + size > width as usize && !line.is_empty() {
+                lines.push(Line::from(Span::styled(std::mem::take(&mut line), style)));
+                used = 0;
+            }
+            line.push(ch);
+            used += size;
+        }
+        lines.push(Line::from(Span::styled(line, style)));
+    }
+    lines
+}
+
+fn render_api_warning(f: &mut Frame, app: &App, area: Rect) {
+    f.render_widget(Paragraph::new(warning_lines(app, area.width)), area);
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
@@ -95,7 +148,11 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         })
         .unwrap_or_else(|| "---".to_string());
 
-    let error_indicator = if app.poll_error.is_some() { " [!]" } else { "" };
+    let error_indicator = if app.last_api_error.is_some() {
+        " [!]"
+    } else {
+        ""
+    };
 
     let header = Line::from(vec![
         Span::styled(
@@ -151,9 +208,9 @@ fn render_list(
             f.render_widget(loading, area);
             return;
         }
-        LoadingState::Error(msg) => {
-            let error =
-                Paragraph::new(format!("  Error: {msg}")).style(Style::default().fg(Color::Red));
+        LoadingState::Error(_msg) => {
+            let error = Paragraph::new("  Unable to load PRs. See error below.")
+                .style(Style::default().fg(Color::Red));
             f.render_widget(error, area);
             return;
         }
@@ -273,13 +330,7 @@ fn render_list(
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let pr_count = app.prs.len();
 
-    let status = if let Some(ref msg) = app.status_message {
-        msg.clone()
-    } else if let Some(ref err) = app.poll_error {
-        format!("Error: {err}")
-    } else {
-        String::new()
-    };
+    let status = app.status_message.clone().unwrap_or_default();
 
     let footer = Line::from(vec![
         Span::styled(
@@ -297,8 +348,8 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(footer), area);
 }
 
-fn render_help(f: &mut Frame, _app: &mut App) {
-    let help_text = vec![
+fn render_help(f: &mut Frame, app: &mut App) {
+    let mut help_text = vec![
         Line::from(""),
         Line::from(Span::styled(
             " GitHub PR Live - Help",
@@ -321,7 +372,17 @@ fn render_help(f: &mut Frame, _app: &mut App) {
         )),
     ];
 
-    let help = Paragraph::new(help_text).block(Block::default().title(" Help "));
+    if let Some(error) = &app.last_api_error {
+        help_text.push(Line::from(""));
+        help_text.push(Line::styled(
+            " Last API error (may have recovered)",
+            Style::default().fg(Color::Yellow),
+        ));
+        help_text.extend(error.split("; ").map(Line::from));
+    }
+    let help = Paragraph::new(help_text)
+        .wrap(Wrap { trim: false })
+        .block(Block::default().title(" Help "));
     f.render_widget(help, f.area());
 }
 
@@ -543,6 +604,94 @@ mod tests {
             assert!(label.contains(if width < 100 { "~" } else { "(stale)" }));
             assert_eq!(style.fg, Some(Color::DarkGray));
             assert!(label.contains("1/2"));
+        }
+    }
+
+    #[test]
+    fn list_keeps_warning_visible_after_snapshot_and_during_refresh() {
+        use crate::app::Message;
+        use crate::poller::PollPayload;
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = App::new(
+            "me".into(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        app.update(Message::PollError(
+            "GitHub token #1: CI unavailable\nHTTP 403\n  permission denied".into(),
+        ));
+        for width in [40, 80] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            for recovered in [false, true] {
+                if recovered {
+                    app.update(Message::PollResult(PollPayload {
+                        generation: 1,
+                        prs: Default::default(),
+                        head_shas: Default::default(),
+                        polled_at: chrono::Utc::now(),
+                    }));
+                    assert!(matches!(app.loading, LoadingState::Loaded));
+                    app.status_message = Some("Refreshing...".into());
+                }
+                terminal.draw(|f| view(f, &mut app)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let lines: Vec<String> = (0..24)
+                    .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+                    .collect();
+                let text = lines.join("\n");
+                assert!(text.contains("API warning"), "{text}");
+                assert!(text.contains("?: details"), "{text}");
+                assert!(text.contains("CI unavailable"), "{text}");
+                let hint_row = lines.iter().position(|l| l.contains("Enter:")).unwrap();
+                let warning_row = lines
+                    .iter()
+                    .position(|l| l.contains("API warning"))
+                    .unwrap();
+                assert!(warning_row > hint_row, "{text}");
+                let http_row = lines.iter().position(|l| l.trim() == "HTTP 403").unwrap();
+                assert_eq!(lines[http_row + 1].trim_end(), "  permission denied");
+                assert!(http_row > warning_row);
+            }
+        }
+    }
+
+    #[test]
+    fn help_preserves_readable_diagnostics_after_successful_poll() {
+        use crate::app::Message;
+        use crate::poller::PollPayload;
+        use indexmap::IndexMap;
+        use ratatui::{Terminal, backend::TestBackend};
+        use std::collections::{HashMap, HashSet};
+        let mut app = App::new(
+            "me".into(),
+            Default::default(),
+            HashSet::new(),
+            HashSet::new(),
+        );
+        app.update(Message::PollError("GitHub token #2: primary limit; HTTP 200; resource=graphql; remaining=0; reset=2026-10-23T15:00:00Z".into()));
+        app.update(Message::PollResult(PollPayload {
+            generation: 1,
+            prs: IndexMap::new(),
+            head_shas: HashMap::new(),
+            polled_at: chrono::Utc::now(),
+        }));
+        assert!(app.poll_error.is_none());
+        app.screen = Screen::Help;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| view(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..24)
+            .flat_map(|y| (0..80).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        for expected in [
+            "token #2",
+            "HTTP 200",
+            "resource=graphql",
+            "remaining=0",
+            "reset=2026-10-23",
+        ] {
+            assert!(text.contains(expected), "{expected}");
         }
     }
 }
