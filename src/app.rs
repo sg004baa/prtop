@@ -47,6 +47,7 @@ pub enum Message {
     CiResult(CiPayload),
     ReviewResult(ReviewPayload),
     PollError(String),
+    ApiWarnings(Option<String>),
 }
 
 pub struct App {
@@ -59,7 +60,7 @@ pub struct App {
     pub loading: LoadingState,
     pub last_poll: Option<DateTime<Utc>>,
     pub poll_error: Option<String>,
-    pub last_api_error: Option<String>,
+    pub api_warning: Option<String>,
     pub new_pr_ids: HashSet<PrId>,
     pub new_comment_pr_ids: HashSet<PrId>,
     pub dismissed_ids: HashSet<PrId>,
@@ -99,7 +100,7 @@ impl App {
             loading: LoadingState::Initial,
             last_poll: None,
             poll_error: None,
-            last_api_error: None,
+            api_warning: None,
             new_pr_ids: HashSet::new(),
             new_comment_pr_ids: HashSet::new(),
             dismissed_ids: HashSet::new(),
@@ -129,7 +130,8 @@ impl App {
                 Message::PollResult(_)
                 | Message::CiResult(_)
                 | Message::ReviewResult(_)
-                | Message::PollError(_) => {}
+                | Message::PollError(_)
+                | Message::ApiWarnings(_) => {}
                 Message::Quit => {
                     self.should_quit = true;
                     self.dirty = true;
@@ -444,8 +446,25 @@ impl App {
                     self.dirty = true;
                 }
             }
+            Message::ApiWarnings(warning) => {
+                if let Some(msg) = &warning {
+                    self.status_message = None;
+                    if matches!(self.loading, LoadingState::Initial | LoadingState::Loading) {
+                        self.loading = LoadingState::Error(msg.clone());
+                    }
+                } else if matches!(self.loading, LoadingState::Error(_))
+                    && self.poll_error.is_none()
+                {
+                    self.loading = if self.last_poll.is_some() {
+                        LoadingState::Loaded
+                    } else {
+                        LoadingState::Loading
+                    };
+                }
+                self.api_warning = warning;
+                self.dirty = true;
+            }
             Message::PollError(msg) => {
-                self.last_api_error = Some(msg.clone());
                 self.poll_error = Some(msg.clone());
                 // フッターは status_message を優先表示するため、"Refreshing..." が
                 // 残っているとエラーが見えないままになる。
@@ -455,6 +474,14 @@ impl App {
                 }
                 self.dirty = true;
             }
+        }
+    }
+
+    pub fn active_warning(&self) -> Option<String> {
+        match (&self.api_warning, &self.poll_error) {
+            (Some(api), Some(local)) => Some(format!("{api}\n{local}")),
+            (Some(message), None) | (None, Some(message)) => Some(message.clone()),
+            (None, None) => None,
         }
     }
 

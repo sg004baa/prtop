@@ -145,9 +145,12 @@ or an unavailable/incomplete review fetch.
 Reviews and review requests are fetched asynchronously for open PRs, with
 pagination and the existing **Pull requests: Read-only** permission. Unchanged
 review summaries are cached for five minutes; a changed PR timestamp, review
-decision or head commit triggers an earlier check. Periodic rechecks also detect
-review changes that do not update the PR timestamp. Failed fetches retry no
-sooner than one minute later. Closed/merged search history is not enriched.
+decision or head commit triggers an earlier check, with a minimum of one minute
+between fetches per PR, including manual refreshes. Changed PRs keep their old
+counts marked stale while waiting. Periodic rechecks also detect review changes
+that do not update the PR timestamp. Failed fetches retry no sooner than one
+minute later. A PR changing during retrieval is retried silently, without
+publishing a partial count. Closed/merged search history is not enriched.
 
 Counts are published only after both connections are complete. A failed fetch
 keeps the previous count with `(stale)` (`~` on narrow terminals), in gray; `?`
@@ -178,12 +181,16 @@ restarting prtop does not reset GitHub's quota.
 
 Rate-limit diagnostics show the HTTP status, endpoint path, resource, remaining
 quota and UTC reset timestamp, or `unknown` for missing headers. Cached cooldown
-errors retain the original response evidence. Press `?` to inspect the last API
-error in the help screen. A dedicated multiline warning remains below the key
-hints after snapshots or manual refreshes. It preserves message line breaks and
-wraps long lines so an error cannot disappear before being noticed. Historical
-warnings are labelled as possibly recovered. Credentials and request bodies
-are excluded from this diagnostic. An actual exhausted primary quota still needs
+errors retain the original response evidence. Press `?` to inspect active API
+warnings in the help screen. The same active warnings appear below the key hints,
+preserving message line breaks and wrapping long lines. Transient network and
+HTTP 5xx failures are shown only after two consecutive failed attempts for the
+same operation (and PR for reviews); locally skipped cooldown requests do not
+count as attempts. Authentication, permission and quota errors remain immediate.
+A successful retry removes that operation's warning from both screens; no
+resolved error history is kept. Success for another token, PR or operation does
+not clear an unresolved warning. Credentials and request bodies are excluded
+from diagnostics. An actual exhausted primary quota still needs
 to wait for its reset; a long countdown alone does not prove the current process
 consumed that quota.
 

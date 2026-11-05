@@ -36,6 +36,14 @@ struct RequestGate {
 }
 
 impl GitHubClient {
+    /// Inspect the shared gate without counting a locally deferred request as a failure.
+    pub async fn graphql_cooldown(&self) -> Option<AppError> {
+        let gate = self.gate.lock().await;
+        gate.services
+            .check("graphql")
+            .or_else(|| gate.limits.lock().expect("rate limits").check("graphql"))
+    }
+
     /// All clones share one request gate, including searches and review summaries.
     /// Keep the gate through body decoding so HTTP-200 GraphQL limits stop queued work.
     pub(super) async fn send_json<T: serde::de::DeserializeOwned>(

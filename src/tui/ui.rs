@@ -96,17 +96,13 @@ fn error_banner_height(app: &App, area: Rect) -> u16 {
 }
 
 fn warning_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    let Some(error) = &app.last_api_error else {
+    let Some(error) = app.active_warning() else {
         return Vec::new();
     };
     if width == 0 {
         return Vec::new();
     }
-    let title = if app.poll_error.is_some() {
-        "API warning - ?: details"
-    } else {
-        "Last API warning - ?: details (may have recovered)"
-    };
+    let title = "API warning - ?: details";
     let mut lines = Vec::new();
     // Preserve explicit newlines and indentation, wrapping long lines to the
     // terminal width so the reserved height matches the rendered text.
@@ -148,7 +144,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         })
         .unwrap_or_else(|| "---".to_string());
 
-    let error_indicator = if app.last_api_error.is_some() {
+    let error_indicator = if app.active_warning().is_some() {
         " [!]"
     } else {
         ""
@@ -372,13 +368,18 @@ fn render_help(f: &mut Frame, app: &mut App) {
         )),
     ];
 
-    if let Some(error) = &app.last_api_error {
+    if let Some(error) = app.active_warning() {
         help_text.push(Line::from(""));
         help_text.push(Line::styled(
-            " Last API error (may have recovered)",
+            " Current warning",
             Style::default().fg(Color::Yellow),
         ));
-        help_text.extend(error.split("; ").map(Line::from));
+        help_text.extend(
+            error
+                .split("; ")
+                .flat_map(str::lines)
+                .map(|line| Line::from(line.to_string())),
+        );
     }
     let help = Paragraph::new(help_text)
         .wrap(Wrap { trim: false })
@@ -608,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn list_keeps_warning_visible_after_snapshot_and_during_refresh() {
+    fn list_keeps_unresolved_warning_after_snapshot_and_during_refresh() {
         use crate::app::Message;
         use crate::poller::PollPayload;
         use ratatui::{Terminal, backend::TestBackend};
@@ -618,9 +619,9 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        app.update(Message::PollError(
+        app.update(Message::ApiWarnings(Some(
             "GitHub token #1: CI unavailable\nHTTP 403\n  permission denied".into(),
-        ));
+        )));
         for width in [40, 80] {
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
             for recovered in [false, true] {
@@ -657,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn help_preserves_readable_diagnostics_after_successful_poll() {
+    fn help_shows_only_unresolved_diagnostics() {
         use crate::app::Message;
         use crate::poller::PollPayload;
         use indexmap::IndexMap;
@@ -669,7 +670,7 @@ mod tests {
             HashSet::new(),
             HashSet::new(),
         );
-        app.update(Message::PollError("GitHub token #2: primary limit; HTTP 200; resource=graphql; remaining=0; reset=2026-10-23T15:00:00Z".into()));
+        app.update(Message::ApiWarnings(Some("GitHub token #2: primary limit; HTTP 200; resource=graphql; remaining=0; reset=2026-10-23T15:00:00Z".into())));
         app.update(Message::PollResult(PollPayload {
             generation: 1,
             prs: IndexMap::new(),
@@ -692,6 +693,19 @@ mod tests {
             "reset=2026-10-23",
         ] {
             assert!(text.contains(expected), "{expected}");
+        }
+        app.update(Message::ApiWarnings(None));
+        assert_eq!(app.screen, Screen::Help);
+        for screen in [Screen::Help, Screen::PrList] {
+            app.screen = screen;
+            terminal.draw(|f| view(f, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = (0..24)
+                .flat_map(|y| (0..80).map(move |x| buffer[(x, y)].symbol()))
+                .collect();
+            assert!(!text.contains("token #2"));
+            assert!(!text.contains("warning"));
+            assert!(!text.contains("[!]"));
         }
     }
 }

@@ -1,3 +1,6 @@
+mod warnings;
+use warnings::{WarningScope, Warnings};
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -53,6 +56,7 @@ struct ReviewCacheEntry {
     retry_at: tokio::time::Instant,
 }
 const REVIEW_TTL: Duration = Duration::from_secs(300);
+const REVIEW_MIN_INTERVAL: Duration = Duration::from_secs(60);
 const FAILURE_RETRY: Duration = Duration::from_secs(60);
 
 async fn fetch_reviews(
@@ -61,11 +65,17 @@ async fn fetch_reviews(
     prs: &IndexMap<PrId, PullRequest>,
     shas: &HashMap<PrId, String>,
     cache: &mut HashMap<PrId, ReviewCacheEntry>,
-    error_tx: &mpsc::Sender<String>,
+    warnings: &mut Warnings,
 ) -> HashMap<PrId, Option<crate::github::reviews::ReviewSnapshot>> {
     cache.retain(|id, _| prs.get(id).is_some_and(|pr| pr.state == PrState::Open));
     let mut statuses = HashMap::new();
-    let mut reported = HashSet::new();
+    warnings.retain_reviews(|index, id| {
+        prs.iter().any(|(pr_id, pr)| {
+            pr_id.to_string() == id
+                && pr.state == PrState::Open
+                && owners.get(pr_id) == Some(&index)
+        })
+    });
     for (id, pr) in prs {
         if pr.state != PrState::Open {
             continue;
@@ -82,43 +92,50 @@ async fn fetch_reviews(
             head_sha: shas.get(id).cloned().unwrap_or_default(),
             decision: pr.review_decision.clone(),
         };
-        if state.disabled || state.retrying {
+        if state.disabled || state.retrying || state.client.graphql_cooldown().await.is_some() {
             if let Some(cached) = cache.get_mut(id) {
                 cached.fresh_until = now;
             }
             statuses.insert(id.clone(), None);
             continue;
         }
-        if cache
-            .get(id)
-            .is_some_and(|c| now < c.retry_at || (c.version == version && now < c.fresh_until))
+        if let Some(cached) = cache.get(id)
+            && (now < cached.retry_at || (cached.version == version && now < cached.fresh_until))
         {
+            // A throttled update must not leave the old review count marked fresh.
+            if cached.version != version || now >= cached.fresh_until {
+                statuses.insert(id.clone(), None);
+            }
             continue;
         }
+        let scope = WarningScope::Review(index, id.to_string());
         let result = state.client.fetch_review_summary(id).await;
         let now = tokio::time::Instant::now();
         match result {
             Ok(snapshot) if snapshot.head_sha == version.head_sha => {
+                warnings.recover(&scope);
                 cache.insert(
                     id.clone(),
                     ReviewCacheEntry {
                         version,
                         fresh_until: now + REVIEW_TTL,
-                        retry_at: now,
+                        retry_at: now + REVIEW_MIN_INTERVAL,
                     },
                 );
                 statuses.insert(id.clone(), Some(snapshot));
             }
             result => {
-                let error = match result {
-                    Err(e) => e.to_string(),
-                    _ => "PR changed during review fetch".into(),
-                };
-                if reported.insert(index) {
-                    let _ = error_tx.try_send(format!(
-                        "GitHub token #{}: Review fetch failed for {id}: {error}",
-                        index + 1
-                    ));
+                match result {
+                    // Both a changed head and a change between pages are normal races.
+                    Ok(_) | Err(AppError::ReviewChanged) => warnings.recover(&scope),
+                    Err(e) => warnings.fail(
+                        scope,
+                        &e,
+                        format!(
+                            "GitHub token #{}: Review fetch failed for {id}: {e}",
+                            index + 1
+                        ),
+                    ),
                 }
                 cache.insert(
                     id.clone(),
@@ -333,7 +350,7 @@ pub struct PollerContext {
 pub async fn polling_loop(
     ctx: PollerContext,
     tx: mpsc::Sender<PollEvent>,
-    error_tx: mpsc::Sender<String>,
+    error_tx: mpsc::Sender<Option<String>>,
     cancel: CancellationToken,
     mut refresh_rx: mpsc::Receiver<()>,
 ) {
@@ -342,6 +359,7 @@ pub async fn polling_loop(
     let dismiss_store = ctx.dismiss_store.clone();
     let mut generation = 0u64;
     let mut review_cache = HashMap::new();
+    let mut warnings = Warnings::default();
     let mut states: Vec<TokenState> = ctx
         .clients
         .into_iter()
@@ -369,28 +387,50 @@ pub async fn polling_loop(
                 let client = states[i].client.clone();
                 let username = username.clone();
                 let include_closed = states[i].cache.is_some();
-                jobs.spawn(async move { (i, fetch_raw(&client, &username, include_closed).await) });
+                jobs.spawn(async move {
+                    // Cooldown rejections are not new failed attempts.
+                    let (result, deferred) = if let Some(error) = client.graphql_cooldown().await {
+                        (Err(error), true)
+                    } else {
+                        (fetch_raw(&client, &username, include_closed).await, false)
+                    };
+                    (i, result, deferred)
+                });
             }
             while let Some(joined) = jobs.join_next().await {
-                let Ok((i, result)) = joined else { continue };
+                let Ok((i, result, deferred)) = joined else {
+                    continue;
+                };
+                let scope = WarningScope::Search(i);
+                if let Err(error) = &result
+                    && !deferred
+                {
+                    let message = if let AppError::Auth(msg) = error {
+                        format!("GitHub token #{}: Auth error: {msg}", i + 1)
+                    } else {
+                        format!("GitHub token #{}: {error}", i + 1)
+                    };
+                    warnings.fail(scope.clone(), error, message);
+                }
                 match result {
                     Ok(raw) => {
+                        warnings.recover(&scope);
                         if let Some(warning) = states[i].client.ci_warning().await {
-                            let _ = error_tx
-                                .send(format!("GitHub token #{}: {warning}", i + 1))
-                                .await;
+                            warnings.set(
+                                WarningScope::Ci(i),
+                                format!("GitHub token #{}: {warning}", i + 1),
+                            );
+                        } else {
+                            warnings.recover(&WarningScope::Ci(i));
                         }
                         states[i].cache = Some(raw);
                         states[i].backoff_secs = 0;
                         states[i].retrying = false;
                         states[i].next_poll = tokio::time::Instant::now() + interval;
                     }
-                    Err(AppError::Auth(msg)) => {
+                    Err(AppError::Auth(_)) => {
                         states[i].disabled = true;
                         states[i].retrying = false;
-                        let _ = error_tx
-                            .send(format!("GitHub token #{}: Auth error: {msg}", i + 1))
-                            .await;
                     }
                     Err(
                         error
@@ -409,11 +449,8 @@ pub async fn polling_loop(
                         // Search, CI and review updates all use GraphQL now.
                         states[i].next_poll = tokio::time::Instant::now()
                             + Duration::from_secs(retry_after_secs.max(1));
-                        let _ = error_tx
-                            .send(format!("GitHub token #{}: {error}", i + 1))
-                            .await;
                     }
-                    Err(e) => {
+                    Err(_) => {
                         states[i].retrying = true;
                         states[i].backoff_secs = if states[i].backoff_secs == 0 {
                             2
@@ -422,16 +459,10 @@ pub async fn polling_loop(
                         };
                         states[i].next_poll = tokio::time::Instant::now()
                             + Duration::from_secs(states[i].backoff_secs);
-                        let _ = error_tx
-                            .send(format!(
-                                "GitHub token #{}: {e} (retry in {}s)",
-                                i + 1,
-                                states[i].backoff_secs
-                            ))
-                            .await;
                     }
                 }
             }
+            warnings.publish(&error_tx).await;
             if states.iter().any(|s| s.cache.is_some()) {
                 let merged = merge_caches(
                     states
@@ -446,13 +477,14 @@ pub async fn polling_loop(
                 apply_dismissals(
                     &dismiss_store,
                     &username,
-                    &error_tx,
+                    &mut warnings,
                     &mut prs,
                     mention_ids,
                     &owners,
                     &states,
                 )
                 .await;
+                warnings.publish(&error_tx).await;
                 // Keep the existing CI event/notification path, but obtain all values
                 // from this search snapshot. No per-PR CI network calls are needed.
                 let statuses = prs
@@ -494,9 +526,10 @@ pub async fn polling_loop(
                         &review_prs,
                         &shas,
                         &mut review_cache,
-                        &error_tx,
+                        &mut warnings,
                     )
                     .await;
+                    warnings.publish(&error_tx).await;
                     let _ = tx
                         .send(PollEvent::Reviews(ReviewPayload {
                             generation,
@@ -530,7 +563,7 @@ pub async fn polling_loop(
 async fn apply_dismissals(
     dismiss_store: &Arc<Mutex<DismissStore>>,
     username: &str,
-    error_tx: &mpsc::Sender<String>,
+    warnings: &mut Warnings,
     prs: &mut IndexMap<PrId, PullRequest>,
     mention_ids: HashSet<PrId>,
     owners: &HashMap<PrId, usize>,
@@ -559,6 +592,7 @@ async fn apply_dismissals(
             grouped.entry(index).or_default().push(candidate);
         }
     }
+    warnings.retain_mentions(|index| grouped.contains_key(&index));
     for (index, candidates) in grouped {
         let Some(client) = states
             .get(index)
@@ -567,9 +601,13 @@ async fn apply_dismissals(
         else {
             continue;
         };
+        if client.graphql_cooldown().await.is_some() {
+            continue;
+        }
         let ids: Vec<PrId> = candidates.iter().map(|(id, _)| id.clone()).collect();
         match client.fetch_recent_comments(&ids).await {
             Ok(comments) => {
+                warnings.recover(&WarningScope::Mentions(index));
                 for (id, dismissed_at) in &candidates {
                     if comments.get(id).is_some_and(|list| {
                         list.iter().any(|c| {
@@ -586,12 +624,11 @@ async fn apply_dismissals(
                 }
             }
             Err(e) => {
-                let _ = error_tx
-                    .send(format!(
-                        "GitHub token #{}: Mention re-check failed: {e}",
-                        index + 1
-                    ))
-                    .await;
+                warnings.fail(
+                    WarningScope::Mentions(index),
+                    &e,
+                    format!("GitHub token #{}: Mention re-check failed: {e}", index + 1),
+                );
             }
         }
     }
@@ -611,7 +648,9 @@ async fn apply_dismissals(
         (store.dismissed_ids(), save_error)
     };
     if let Some(message) = save_error {
-        let _ = error_tx.send(message).await;
+        warnings.set(WarningScope::Dismissals, message);
+    } else {
+        warnings.recover(&WarningScope::Dismissals);
     }
     prs.retain(|id, pr| pr.role != PrRole::Mentioned || !still_dismissed.contains(id));
 }
@@ -971,7 +1010,9 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let error = error_rx.recv().await.expect("error channel closed");
-                if error.contains("GitHub token #2") && error.contains("Auth error") {
+                if error.is_some_and(|error| {
+                    error.contains("GitHub token #2") && error.contains("Auth error")
+                }) {
                     break;
                 }
             }
@@ -1072,7 +1113,8 @@ mod tests {
         let error_msg = tokio::time::timeout(Duration::from_secs(5), err_rx.recv())
             .await
             .expect("timeout waiting for auth error")
-            .expect("channel closed");
+            .expect("channel closed")
+            .expect("active warning");
         assert!(
             error_msg.contains("Auth error"),
             "unexpected message: {error_msg}"
@@ -1294,43 +1336,56 @@ mod tests {
         let owners = HashMap::from([(id.clone(), 0), (closed.id.clone(), 0)]);
         let mut shas = HashMap::from([(id.clone(), sha), (closed.id.clone(), "sha".into())]);
         let mut cache = HashMap::new();
-        let (tx, _rx) = mpsc::channel(10);
+        let mut warnings = Warnings::default();
         assert_eq!(
-            fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &tx)
+            fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &mut warnings)
                 .await
                 .len(),
             1
         );
         assert!(
-            fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &tx)
+            fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &mut warnings)
                 .await
                 .is_empty()
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
         prs.get_mut(&id).unwrap().updated_at += chrono::Duration::seconds(1);
+        // A changed PR is stale, but does not bypass the minimum interval.
+        let throttled =
+            fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &mut warnings).await;
+        assert!(throttled[&id].is_none());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        cache.get_mut(&id).unwrap().retry_at = tokio::time::Instant::now();
         assert_eq!(
-            fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &tx)
+            fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &mut warnings)
                 .await
                 .len(),
             1
         );
         cache.get_mut(&id).unwrap().fresh_until = tokio::time::Instant::now();
+        cache.get_mut(&id).unwrap().retry_at = tokio::time::Instant::now();
         assert_eq!(
-            fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &tx)
+            fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &mut warnings)
                 .await
                 .len(),
             1
         );
         // A changed SHA invalidates the cache; a response for the old SHA is a failure.
         shas.insert(id.clone(), "new-sha".into());
-        let result = fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &tx).await;
+        cache.get_mut(&id).unwrap().retry_at = tokio::time::Instant::now();
+        let result = fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &mut warnings).await;
         assert!(result[&id].is_none());
         assert!(
-            fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &tx)
-                .await
-                .is_empty()
+            fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &mut warnings).await[&id]
+                .is_none()
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 4);
+        let (tx, mut rx) = mpsc::channel(10);
+        warnings.publish(&tx).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "head races must not produce warnings"
+        );
     }
 
     #[tokio::test]
@@ -1341,7 +1396,7 @@ mod tests {
         let prs = IndexMap::from([(id.clone(), pr)]);
         let owners = HashMap::from([(id.clone(), 0)]);
         let shas = HashMap::from([(id.clone(), "sha".into())]);
-        let (tx, _rx) = mpsc::channel(10);
+        let mut warnings = Warnings::default();
         for disabled in [true, false] {
             let states = vec![TokenState {
                 client: GitHubClient::new_with_base_url("token".into(), server.uri()),
@@ -1353,10 +1408,138 @@ mod tests {
             }];
             let mut cache = HashMap::new();
             assert!(
-                fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &tx).await[&id].is_none()
+                fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &mut warnings).await[&id]
+                    .is_none()
             );
         }
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_warning_survives_other_pr_success_and_clears_on_its_own_retry() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let server = MockServer::start().await;
+        let recovered = Arc::new(AtomicBool::new(false));
+        let response_recovered = recovered.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let response = if body["variables"]["number"] == 1 && !response_recovered.load(Ordering::SeqCst) {
+                    serde_json::json!({"errors": [{"message": "permission denied"}]})
+                } else {
+                    serde_json::json!({"data": {"repository": {"pullRequest": {
+                        "headRefOid":"sha", "updatedAt":"2026-01-01T00:00:00Z",
+                        "state":"OPEN", "isDraft":false, "author":{"login":"author"},
+                        "reviews":{"nodes":[], "pageInfo":{"hasNextPage":false,"endCursor":null}},
+                        "reviewRequests":{"nodes":[], "pageInfo":{"hasNextPage":false,"endCursor":null}}
+                    }}}})
+                };
+                ResponseTemplate::new(200).set_body_json(response)
+            }).mount(&server).await;
+        let states = vec![TokenState {
+            client: GitHubClient::new_with_base_url("token".into(), server.uri()),
+            cache: None,
+            next_poll: tokio::time::Instant::now(),
+            backoff_secs: 0,
+            retrying: false,
+            disabled: false,
+        }];
+        let mut prs = IndexMap::new();
+        let mut owners = HashMap::new();
+        let mut shas = HashMap::new();
+        for number in [1, 2] {
+            let (pr, _) = node_to_pr(&make_node("org", "repo", number), PrRole::Author);
+            owners.insert(pr.id.clone(), 0);
+            shas.insert(pr.id.clone(), "sha".into());
+            prs.insert(pr.id.clone(), pr);
+        }
+        let id = prs.keys().next().unwrap().clone();
+        let mut cache = HashMap::new();
+        let mut warnings = Warnings::default();
+        let (tx, mut rx) = mpsc::channel(10);
+        let result = fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &mut warnings).await;
+        assert!(result[&id].is_none());
+        assert_eq!(result.values().filter(|r| r.is_some()).count(), 1);
+        warnings.publish(&tx).await;
+        assert!(rx.recv().await.unwrap().unwrap().contains("org/repo#1"));
+        recovered.store(true, Ordering::SeqCst);
+        // Even a manual refresh must wait for the failed PR's retry deadline.
+        fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &mut warnings).await;
+        warnings.publish(&tx).await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        cache.get_mut(&id).unwrap().retry_at = tokio::time::Instant::now();
+        let result = fetch_reviews(&states, &owners, &prs, &shas, &mut cache, &mut warnings).await;
+        assert!(result[&id].is_some());
+        warnings.publish(&tx).await;
+        assert_eq!(rx.recv().await, Some(None));
+    }
+
+    #[tokio::test]
+    async fn repeated_504_warns_then_success_clears_without_cooldown_warning_spam() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                if observed.fetch_add(1, Ordering::SeqCst) < 2 {
+                    ResponseTemplate::new(504).insert_header("Retry-After", "1")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(empty_graphql_response())
+                }
+            })
+            .mount(&server)
+            .await;
+        let (tx, mut rx) = mpsc::channel(16);
+        let (error_tx, mut errors) = mpsc::channel(16);
+        let (refresh_tx, refresh_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(polling_loop(
+            PollerContext {
+                clients: vec![GitHubClient::new_with_base_url(
+                    "token".into(),
+                    server.uri(),
+                )],
+                username: "user".into(),
+                interval: Duration::from_secs(3600),
+                dismiss_store: test_dismiss_store("warning-recovery"),
+            },
+            tx,
+            error_tx,
+            cancel.clone(),
+            refresh_rx,
+        ));
+        // Wait until the first request has failed, then force a refresh in cooldown.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while attempts.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        refresh_tx.send(()).await.unwrap();
+        let warning = tokio::time::timeout(Duration::from_secs(5), errors.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(warning.contains("504"));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "one warning after two real requests"
+        );
+        let cleared = tokio::time::timeout(Duration::from_secs(5), errors.recv())
+            .await
+            .unwrap();
+        assert_eq!(cleared, Some(None));
+        tokio::time::timeout(Duration::from_secs(5), recv_snapshot(&mut rx))
+            .await
+            .unwrap();
+        assert!(errors.try_recv().is_err());
+        cancel.cancel();
+        handle.await.unwrap();
     }
 
     #[tokio::test]

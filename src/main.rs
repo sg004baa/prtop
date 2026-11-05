@@ -78,11 +78,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         let error_sender = {
             let tx = error_tx;
-            let (err_tx, mut err_rx) = mpsc::channel::<String>(64);
+            let (err_tx, mut err_rx) = mpsc::channel::<Option<String>>(64);
             let forward_tx = tx;
             tokio::spawn(async move {
                 while let Some(msg) = err_rx.recv().await {
-                    let _ = forward_tx.send(Message::PollError(msg)).await;
+                    let _ = forward_tx.send(Message::ApiWarnings(msg)).await;
                 }
             });
             err_tx

@@ -29,6 +29,9 @@ pub enum AppError {
     #[error("GraphQL error: {0}")]
     GraphQl(String),
 
+    #[error("PR changed during review fetch")]
+    ReviewChanged,
+
     #[error("Config error: {0}")]
     Config(String),
 
