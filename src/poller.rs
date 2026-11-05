@@ -1478,12 +1478,27 @@ mod tests {
     #[tokio::test]
     async fn repeated_504_warns_then_success_clears_without_cooldown_warning_spam() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+        // These are deadlock guards, not latency assertions. Concurrent macOS
+        // tests can delay local HTTP responses well beyond five seconds.
+        const WAIT: Duration = Duration::from_secs(30);
         let server = MockServer::start().await;
+        let first_request = Arc::new(tokio::sync::Notify::new());
+        let request_seen = first_request.clone();
         let attempts = Arc::new(AtomicUsize::new(0));
         let observed = attempts.clone();
         Mock::given(method("POST"))
-            .respond_with(move |_: &wiremock::Request| {
-                if observed.fetch_add(1, Ordering::SeqCst) < 2 {
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                // Fail one search per poll. Other searches may reach the server
+                // if a slow runner lets the cooldown expire within that poll.
+                if body["variables"]["query"] != query::author_search_query("user") {
+                    return ResponseTemplate::new(200).set_body_json(empty_graphql_response());
+                }
+                let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    request_seen.notify_one();
+                }
+                if attempt < 2 {
                     ResponseTemplate::new(504).insert_header("Retry-After", "1")
                 } else {
                     ResponseTemplate::new(200).set_body_json(empty_graphql_response())
@@ -1510,36 +1525,37 @@ mod tests {
             cancel.clone(),
             refresh_rx,
         ));
-        // Wait until the first request has failed, then force a refresh in cooldown.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while attempts.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        // Queue a refresh after the first request. The poller handles it after
+        // completing that failed poll, when the service cooldown is active.
+        tokio::time::timeout(WAIT, first_request.notified())
+            .await
+            .expect("first HTTP request was not received");
         refresh_tx.send(()).await.unwrap();
-        let warning = tokio::time::timeout(Duration::from_secs(5), errors.recv())
+        let warning = tokio::time::timeout(WAIT, errors.recv())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
         assert!(warning.contains("504"));
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            2,
-            "one warning after two real requests"
-        );
-        let cleared = tokio::time::timeout(Duration::from_secs(5), errors.recv())
-            .await
-            .unwrap();
+        // The poller may already have started recovery before this receiver
+        // runs. Check the exact final count only after it has finished.
+        assert!(attempts.load(Ordering::SeqCst) >= 2);
+        let cleared = tokio::time::timeout(WAIT, errors.recv()).await.unwrap();
         assert_eq!(cleared, Some(None));
-        tokio::time::timeout(Duration::from_secs(5), recv_snapshot(&mut rx))
+        tokio::time::timeout(WAIT, recv_snapshot(&mut rx))
             .await
             .unwrap();
         assert!(errors.try_recv().is_err());
         cancel.cancel();
-        handle.await.unwrap();
+        tokio::time::timeout(WAIT, handle)
+            .await
+            .expect("poller did not stop")
+            .unwrap();
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "two failed author searches and one successful retry; cooldown refresh adds none"
+        );
     }
 
     #[tokio::test]
