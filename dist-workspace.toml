@@ -16,3 +16,7 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
 allow-dirty = ["ci"]
+
+[dist.github-custom-runners]
+# macos-14 (the dist 0.32.0 default for Apple ARM64) is retired.
+aarch64-apple-darwin = "macos-15"
