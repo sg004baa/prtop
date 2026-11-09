@@ -16,6 +16,7 @@
           "createdAt": "2024-01-15T10:30:00Z",
           "updatedAt": "2024-01-16T14:20:00Z",
           "reviewDecision": "APPROVED",
+          "headRefOid": "head-1234",
           "author": {
             "login": "testuser"
           },
@@ -34,7 +35,7 @@
           "reviewThreads": { "totalCount": 1 },
           "commits": {
             "nodes": [
-              { "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }
+              { "commit": { "oid": "head-1234", "statusCheckRollup": { "state": "SUCCESS", "contexts": { "totalCount": 2 } } } }
             ]
           }
         },
@@ -47,6 +48,7 @@
           "createdAt": "2024-01-10T08:00:00Z",
           "updatedAt": "2024-01-14T16:45:00Z",
           "reviewDecision": null,
+          "headRefOid": "head-5678",
           "author": {
             "login": "testuser"
           },
@@ -60,7 +62,7 @@
           "reviewThreads": { "totalCount": 0 },
           "commits": {
             "nodes": [
-              { "commit": { "statusCheckRollup": null } }
+              { "commit": { "oid": "head-5678", "statusCheckRollup": null } }
             ]
           }
         }

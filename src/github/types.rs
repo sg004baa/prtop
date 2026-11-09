@@ -74,6 +74,8 @@ pub struct PrNode {
     pub review_decision: Option<String>,
     #[serde(default)]
     pub head_ref_oid: String,
+    #[serde(default)]
+    pub commits: Option<CommitConnection>,
     pub author: Option<ActorNode>,
     pub repository: RepoNode,
     pub comments: CommentsConnection,
@@ -97,26 +99,49 @@ pub struct RepoOwnerNode {
     pub login: String,
 }
 
-// --- REST API types for CI status fetch ---
-
+/// Only the last PR commit is requested; verify its OID before using its CI state.
 #[derive(Debug, Deserialize)]
-pub struct CombinedStatusResponse {
+pub struct CommitConnection {
+    pub nodes: Option<Vec<Option<CommitNode>>>,
+}
+#[derive(Debug, Deserialize)]
+pub struct CommitNode {
+    pub commit: Commit,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Commit {
+    pub oid: String,
+    pub status_check_rollup: Option<StatusCheckRollup>,
+}
+#[derive(Debug, Deserialize)]
+pub struct StatusCheckRollup {
     pub state: String,
-    #[serde(default)]
-    pub statuses: Vec<serde::de::IgnoredAny>,
+    pub contexts: TotalCount,
 }
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct CheckRunsResponse {
-    #[serde(default)]
-    pub total_count: u64,
-    #[serde(default)]
-    pub check_runs: Vec<CheckRun>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CheckRun {
-    pub status: String,
-    pub conclusion: Option<String>,
+impl PrNode {
+    pub fn ci_status(&self) -> Option<crate::types::CiStatus> {
+        use crate::types::CiStatus;
+        let commit = &self
+            .commits
+            .as_ref()?
+            .nodes
+            .as_ref()?
+            .last()?
+            .as_ref()?
+            .commit;
+        if self.head_ref_oid.is_empty() || commit.oid != self.head_ref_oid {
+            return None;
+        }
+        let rollup = commit.status_check_rollup.as_ref()?;
+        if rollup.contexts.total_count == 0 {
+            return None;
+        }
+        match rollup.state.as_str() {
+            "SUCCESS" => Some(CiStatus::Success),
+            "FAILURE" | "ERROR" => Some(CiStatus::Failure),
+            "PENDING" | "EXPECTED" => Some(CiStatus::Pending),
+            _ => None,
+        }
+    }
 }
