@@ -164,7 +164,7 @@ impl GitHubClient {
                 pr.is_draft,
             );
             if version.as_ref().is_some_and(|v| v != &current_version) {
-                return Err(invalid("pull request changed while paging"));
+                return Err(AppError::ReviewChanged);
             }
             version = Some(current_version);
             if !reviews_done {
