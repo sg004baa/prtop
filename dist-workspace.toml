@@ -18,6 +18,4 @@ publish-jobs = ["homebrew"]
 allow-dirty = ["ci"]
 
 [dist.github-custom-runners]
-# macos-14 (the dist 0.32.0 default for Apple ARM64) is retired.
-# Track the latest GA image instead of pinning, so this does not break again at the next retirement.
 aarch64-apple-darwin = "macos-latest"
