@@ -8,6 +8,7 @@ use crate::error::AppError;
 pub(super) enum WarningScope {
     Search(usize),
     Review(usize, String),
+    Comments(usize, String),
     Ci(usize),
     Mentions(usize),
     Dismissals,
@@ -52,6 +53,13 @@ impl Warnings {
     pub fn retain_reviews(&mut self, keep: impl Fn(usize, &str) -> bool) {
         self.failures.retain(|scope, _| match scope {
             WarningScope::Review(index, id) => keep(*index, id),
+            _ => true,
+        });
+    }
+
+    pub fn retain_comments(&mut self, keep: impl Fn(usize, &str) -> bool) {
+        self.failures.retain(|scope, _| match scope {
+            WarningScope::Comments(index, id) => keep(*index, id),
             _ => true,
         });
     }

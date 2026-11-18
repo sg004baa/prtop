@@ -46,8 +46,13 @@ query($query: String!, $first: Int!, $after: String, $includeCI: Boolean!) {
             }
           }
         }
-        reviewThreads {
+        reviewThreads(last: 1) {
           totalCount
+          nodes {
+            comments(first: 1) {
+              nodes { author { login } }
+            }
+          }
         }
       }
     }

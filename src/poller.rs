@@ -14,9 +14,10 @@ use tokio_util::sync::CancellationToken;
 use crate::dismiss::{DismissStore, contains_mention};
 use crate::error::AppError;
 use crate::github::client::{GitHubClient, MAX_PAGES};
+use crate::github::comment_activity::CommentSource;
 use crate::github::query;
-use crate::github::types::PrNode;
-use crate::types::{PrId, PrRole, PrState, PullRequest, ReviewDecision};
+use crate::github::types::{CommentNode, PrNode, ReviewThreadNode};
+use crate::types::{CommentActivity, PrId, PrRole, PrState, PullRequest, ReviewDecision};
 
 pub enum PollEvent {
     Snapshot(PollPayload),
@@ -184,13 +185,26 @@ fn node_to_pr(node: &PrNode, role: PrRole) -> (PullRequest, String) {
         updated_at: node.updated_at.parse::<DateTime<Utc>>().unwrap_or_default(),
         is_draft: node.is_draft,
         review_decision: ReviewDecision::from_str_opt(node.review_decision.as_deref()),
-        total_comments: node.comments.total_count + node.review_threads.total_count,
-        last_commenter: node
-            .comments
-            .nodes
-            .first()
-            .and_then(|c| c.author.as_ref())
-            .map(|a| a.login.clone()),
+        comments: CommentActivity {
+            total_count: node.comments.total_count,
+            recent_authors: node
+                .comments
+                .nodes
+                .iter()
+                .rev()
+                .map(CommentNode::author_login)
+                .collect(),
+        },
+        review_threads: CommentActivity {
+            total_count: node.review_threads.total_count,
+            recent_authors: node
+                .review_threads
+                .nodes
+                .iter()
+                .rev()
+                .map(ReviewThreadNode::author_login)
+                .collect(),
+        },
         ci_status: node.ci_status(),
     };
     (pr, head_sha)
@@ -339,6 +353,79 @@ fn merge_caches<'a>(caches: impl Iterator<Item = (usize, &'a RawPoll)>) -> Cache
     }
 }
 
+async fn complete_comment_activity(
+    prs: &mut IndexMap<PrId, PullRequest>,
+    owners: &HashMap<PrId, usize>,
+    states: &[TokenState],
+    username: &str,
+    counts: &mut HashMap<PrId, [u64; 2]>,
+    warnings: &mut Warnings,
+) {
+    counts.retain(|id, _| prs.get(id).is_some_and(|pr| pr.role == PrRole::Author));
+    warnings.retain_comments(|index, id| {
+        counts
+            .keys()
+            .any(|pr_id| owners.get(pr_id) == Some(&index) && pr_id.to_string() == id)
+    });
+    for (id, pr) in prs.iter_mut().filter(|(_, pr)| pr.role == PrRole::Author) {
+        let index = owners[id];
+        let client = &states[index].client;
+        let current = [pr.comments.total_count, pr.review_threads.total_count];
+        let [previous_comments, previous_threads] = *counts.entry(id.clone()).or_insert(current);
+        let mut error = None;
+        for (source, activity, previous_count) in [
+            (
+                CommentSource::Conversation,
+                &mut pr.comments,
+                previous_comments,
+            ),
+            (
+                CommentSource::ReviewThread,
+                &mut pr.review_threads,
+                previous_threads,
+            ),
+        ] {
+            let added = activity.total_count.saturating_sub(previous_count);
+            if added <= activity.recent_authors.len() as u64
+                || activity.has_new_from_others(previous_count, username)
+            {
+                continue;
+            }
+            match client
+                .fetch_comment_authors(id, source, activity.total_count, added)
+                .await
+            {
+                Ok(authors) => activity.recent_authors = authors,
+                Err(failure) => {
+                    // Leave this count pending so the next snapshot retries the same entries.
+                    activity.total_count = previous_count;
+                    activity.recent_authors.clear();
+                    if !matches!(failure, AppError::CommentActivityChanged) {
+                        error = Some(failure);
+                    }
+                }
+            }
+        }
+        counts.insert(
+            id.clone(),
+            [pr.comments.total_count, pr.review_threads.total_count],
+        );
+        let scope = WarningScope::Comments(index, id.to_string());
+        if let Some(error) = error {
+            warnings.fail(
+                scope,
+                &error,
+                format!(
+                    "GitHub token #{}: Comment fetch failed for {id}: {error}",
+                    index + 1
+                ),
+            );
+        } else {
+            warnings.recover(&scope);
+        }
+    }
+}
+
 /// polling_loop の実行時依存(クライアント・対象ユーザー・ポーリング間隔・dismiss 状態)。
 pub struct PollerContext {
     pub clients: Vec<GitHubClient>,
@@ -359,6 +446,7 @@ pub async fn polling_loop(
     let dismiss_store = ctx.dismiss_store.clone();
     let mut generation = 0u64;
     let mut review_cache = HashMap::new();
+    let mut comment_counts = HashMap::new();
     let mut warnings = Warnings::default();
     let mut states: Vec<TokenState> = ctx
         .clients
@@ -484,6 +572,17 @@ pub async fn polling_loop(
                     &states,
                 )
                 .await;
+                tokio::select! {
+                    _ = complete_comment_activity(
+                        &mut prs,
+                        &owners,
+                        &states,
+                        &username,
+                        &mut comment_counts,
+                        &mut warnings,
+                    ) => {},
+                    _ = cancel.cancelled() => return,
+                }
                 warnings.publish(&error_tx).await;
                 // Keep the existing CI event/notification path, but obtain all values
                 // from this search snapshot. No per-PR CI network calls are needed.
@@ -660,7 +759,7 @@ mod tests {
     use super::*;
     use crate::github::client::GitHubClient;
     use crate::github::types::{
-        ActorNode, CommentsConnection, PrNode, RepoNode, RepoOwnerNode, TotalCount,
+        ActorNode, CommentsConnection, PrNode, RepoNode, RepoOwnerNode, ReviewThreadsConnection,
     };
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -690,7 +789,10 @@ mod tests {
                 total_count: 0,
                 nodes: vec![],
             },
-            review_threads: TotalCount { total_count: 0 },
+            review_threads: ReviewThreadsConnection {
+                total_count: 0,
+                nodes: Vec::new(),
+            },
         }
     }
 
@@ -845,10 +947,10 @@ mod tests {
         );
     }
 
-    // --- node_to_pr last_commenter extraction ---
+    // --- node_to_pr comment authors ---
 
     #[test]
-    fn node_to_pr_extracts_last_commenter() {
+    fn node_to_pr_extracts_recent_comment_author() {
         use crate::github::types::CommentNode;
         let mut node = make_node("org", "repo", 1);
         node.comments = CommentsConnection {
@@ -860,15 +962,15 @@ mod tests {
             }],
         };
         let (pr, _) = node_to_pr(&node, PrRole::Author);
-        assert_eq!(pr.last_commenter.as_deref(), Some("reviewer1"));
-        assert_eq!(pr.total_comments, 5); // review_threads(0) + comments(5)
+        assert_eq!(pr.comments.recent_authors, vec![Some("reviewer1".into())]);
+        assert_eq!(pr.comments.total_count, 5);
     }
 
     #[test]
     fn node_to_pr_empty_comments_gives_none() {
         let node = make_node("org", "repo", 1);
         let (pr, _) = node_to_pr(&node, PrRole::Author);
-        assert_eq!(pr.last_commenter, None);
+        assert!(pr.comments.recent_authors.is_empty());
     }
 
     #[test]
@@ -880,7 +982,32 @@ mod tests {
             nodes: vec![CommentNode { author: None }],
         };
         let (pr, _) = node_to_pr(&node, PrRole::Author);
-        assert_eq!(pr.last_commenter, None);
+        assert_eq!(pr.comments.recent_authors, vec![None]);
+    }
+
+    #[test]
+    fn node_to_pr_uses_the_root_comment_author_for_review_threads() {
+        use crate::github::types::ReviewThreadComments;
+
+        let mut node = make_node("org", "repo", 1);
+        node.review_threads = ReviewThreadsConnection {
+            total_count: 2,
+            nodes: vec![ReviewThreadNode {
+                comments: ReviewThreadComments {
+                    nodes: vec![CommentNode {
+                        author: Some(ActorNode {
+                            login: "otheruser".into(),
+                        }),
+                    }],
+                },
+            }],
+        };
+        let (pr, _) = node_to_pr(&node, PrRole::Author);
+        assert_eq!(pr.review_threads.total_count, 2);
+        assert_eq!(
+            pr.review_threads.recent_authors,
+            vec![Some("otheruser".into())]
+        );
     }
 
     #[test]

@@ -570,8 +570,8 @@ mod tests {
                 updated_at: Utc::now(),
                 is_draft: false,
                 review_decision: None,
-                total_comments: 0,
-                last_commenter: None,
+                comments: Default::default(),
+                review_threads: Default::default(),
                 ci_status: None,
             };
             app.update(Message::PollResult(PollPayload {
