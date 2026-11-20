@@ -40,16 +40,59 @@ pub struct TotalCount {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewThreadsConnection {
+    pub total_count: u64,
+    #[serde(default, deserialize_with = "available_nodes")]
+    pub nodes: Vec<ReviewThreadNode>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReviewThreadNode {
+    pub comments: ReviewThreadComments,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReviewThreadComments {
+    #[serde(default, deserialize_with = "available_nodes")]
+    pub nodes: Vec<CommentNode>,
+}
+
+impl ReviewThreadNode {
+    pub fn author_login(&self) -> Option<String> {
+        self.comments
+            .nodes
+            .first()
+            .and_then(CommentNode::author_login)
+    }
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CommentNode {
     pub author: Option<ActorNode>,
+}
+
+impl CommentNode {
+    pub fn author_login(&self) -> Option<String> {
+        self.author.as_ref().map(|author| author.login.clone())
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommentsConnection {
     pub total_count: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "available_nodes")]
     pub nodes: Vec<CommentNode>,
+}
+
+fn available_nodes<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    let nodes = Option::<Vec<Option<T>>>::deserialize(deserializer)?;
+    Ok(nodes.unwrap_or_default().into_iter().flatten().collect())
 }
 
 /// [`crate::github::client::GitHubClient::fetch_recent_comments`] が返す直近コメント。
@@ -79,7 +122,7 @@ pub struct PrNode {
     pub author: Option<ActorNode>,
     pub repository: RepoNode,
     pub comments: CommentsConnection,
-    pub review_threads: TotalCount,
+    pub review_threads: ReviewThreadsConnection,
 }
 
 #[derive(Debug, Deserialize)]

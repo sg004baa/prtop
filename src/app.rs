@@ -324,13 +324,17 @@ impl App {
                         }
                     }
 
-                    // Comment count increase: compare all PRs directly, independent of updated_at
-                    // Skip notification if the last commenter is the current user (self-filter)
+                    // Comment activity is independent of the PR's updated_at.
                     for (id, new_pr) in &incoming {
                         if let Some(old_pr) = self.prs.get(id)
-                            && new_pr.total_comments > old_pr.total_comments
                             && new_pr.role == PrRole::Author
-                            && new_pr.last_commenter.as_deref() != Some(self.username.as_str())
+                            && (new_pr
+                                .comments
+                                .has_new_from_others(old_pr.comments.total_count, &self.username)
+                                || new_pr.review_threads.has_new_from_others(
+                                    old_pr.review_threads.total_count,
+                                    &self.username,
+                                ))
                         {
                             if self.notify_events.contains(&NotifyEvent::NewComment) {
                                 self.pending_notifications.push(Notification {
@@ -672,8 +676,15 @@ mod tests {
             updated_at: base + chrono::Duration::seconds(updated_secs),
             is_draft: false,
             review_decision,
-            total_comments,
-            last_commenter: None,
+            comments: crate::types::CommentActivity {
+                total_count: total_comments,
+                recent_authors: if total_comments == 0 {
+                    vec![]
+                } else {
+                    vec![None]
+                },
+            },
+            review_threads: Default::default(),
             ci_status: None,
         }
     }
@@ -1718,10 +1729,10 @@ mod tests {
         );
         app.update(Message::PollResult(payload_from(prs)));
 
-        // Second poll: comment count increased, but last commenter is self
+        // Second poll: all new comments are from the configured user.
         let mut prs2 = IndexMap::new();
         let mut pr = make_pr_with_comments(&id, PrRole::Author, None, 100, 3);
-        pr.last_commenter = Some("testuser".to_string());
+        pr.comments.recent_authors = vec![Some("TESTUSER".into()); 3];
         prs2.insert(id.clone(), pr);
         app.update(Message::PollResult(payload_from(prs2)));
 
@@ -1729,10 +1740,11 @@ mod tests {
             app.pending_notifications.is_empty(),
             "self comment should not trigger notification"
         );
+        assert!(!app.new_comment_pr_ids.contains(&id));
     }
 
     #[test]
-    fn other_comment_triggers_notification() {
+    fn other_comment_before_self_comment_still_triggers_notification() {
         let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
 
@@ -1744,10 +1756,14 @@ mod tests {
         );
         app.update(Message::PollResult(payload_from(prs)));
 
-        // Second poll: comment count increased, last commenter is someone else
+        // Both users commented between polls, with our reply newest.
         let mut prs2 = IndexMap::new();
         let mut pr = make_pr_with_comments(&id, PrRole::Author, None, 100, 3);
-        pr.last_commenter = Some("otheruser".to_string());
+        pr.comments.recent_authors = vec![
+            Some("testuser".into()),
+            Some("otheruser".into()),
+            Some("testuser".into()),
+        ];
         prs2.insert(id.clone(), pr);
         app.update(Message::PollResult(payload_from(prs2)));
 
@@ -1756,7 +1772,40 @@ mod tests {
     }
 
     #[test]
-    fn last_commenter_none_triggers_notification() {
+    fn new_review_thread_uses_its_own_author_for_notifications() {
+        let mut app = test_app(NotifyEvent::all());
+        let id = make_id(1);
+        let mut pr = make_pr_with_comments(&id, PrRole::Author, None, 0, 1);
+        pr.comments.recent_authors = vec![Some("otheruser".into())];
+        app.update(Message::PollResult(payload_from(IndexMap::from([(
+            id.clone(),
+            pr.clone(),
+        )]))));
+
+        pr.review_threads.total_count = 1;
+        pr.review_threads.recent_authors = vec![Some("testuser".into())];
+        app.update(Message::PollResult(payload_from(IndexMap::from([(
+            id.clone(),
+            pr.clone(),
+        )]))));
+        assert!(app.pending_notifications.is_empty());
+        assert!(!app.new_comment_pr_ids.contains(&id));
+
+        pr.review_threads.total_count = 2;
+        pr.review_threads.recent_authors = vec![Some("otheruser".into())];
+        pr.comments.total_count = 2;
+        pr.comments.recent_authors = vec![Some("testuser".into())];
+        app.update(Message::PollResult(payload_from(IndexMap::from([(
+            id.clone(),
+            pr,
+        )]))));
+        assert_eq!(app.pending_notifications.len(), 1);
+        assert_eq!(app.pending_notifications[0].title, "New comment");
+        assert!(app.new_comment_pr_ids.contains(&id));
+    }
+
+    #[test]
+    fn comment_with_unknown_author_triggers_notification() {
         let mut app = test_app(NotifyEvent::all());
         let id = make_id(1);
 
@@ -1768,7 +1817,7 @@ mod tests {
         );
         app.update(Message::PollResult(payload_from(prs)));
 
-        // Second poll: comment count increased, last_commenter is None (deleted user)
+        // Second poll: comment count increased, author is unknown (e.g. deleted user)
         let mut prs2 = IndexMap::new();
         prs2.insert(
             id.clone(),
@@ -1779,7 +1828,7 @@ mod tests {
         assert_eq!(
             app.pending_notifications.len(),
             1,
-            "None last_commenter should still notify (safe fallback)"
+            "a comment with an unknown author should still notify"
         );
         assert_eq!(app.pending_notifications[0].title, "New comment");
     }

@@ -22,8 +22,8 @@ fn make_pr(owner: &str, repo: &str, number: u64, updated_secs: i64) -> (PrId, Pu
         updated_at: base + chrono::Duration::seconds(updated_secs),
         is_draft: false,
         review_decision: None,
-        total_comments: 0,
-        last_commenter: None,
+        comments: Default::default(),
+        review_threads: Default::default(),
         ci_status: None,
     };
     (id, pr)

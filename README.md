@@ -102,7 +102,7 @@ enabled = true
 | `pr_closed`           |    ✅    | Your authored PR transitions to closed                          |
 | `pr_merged`           |    ✅    | Your authored PR is merged                                      |
 | `re_review_requested` |    ✅    | `review_decision` changes to `ReviewRequired`                   |
-| `new_comment`         |    ✅    | Comment count increases on your authored PR (self-comment skip) |
+| `new_comment`         |    ✅    | Someone else adds a PR conversation comment or starts a review thread |
 | `pr_approved`         |    ✅    | All tracked reviewers approve your open, non-draft PR           |
 | `ci_finished`         |    ❌    | CI transitions from in-progress to success/failure (author only) |
 

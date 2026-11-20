@@ -32,6 +32,9 @@ pub enum AppError {
     #[error("PR changed during review fetch")]
     ReviewChanged,
 
+    #[error("PR comments changed during comment fetch")]
+    CommentActivityChanged,
+
     #[error("Config error: {0}")]
     Config(String),
 

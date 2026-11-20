@@ -63,6 +63,27 @@ impl CiStatus {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CommentActivity {
+    pub total_count: u64,
+    // Newest first. None represents a comment without a visible author.
+    pub recent_authors: Vec<Option<String>>,
+}
+
+impl CommentActivity {
+    pub fn has_new_from_others(&self, previous_count: u64, username: &str) -> bool {
+        let added = self.total_count.saturating_sub(previous_count);
+        self.recent_authors
+            .iter()
+            .take(usize::try_from(added).unwrap_or(usize::MAX))
+            .any(|author| {
+                author
+                    .as_deref()
+                    .is_none_or(|login| !login.eq_ignore_ascii_case(username))
+            })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PullRequest {
     pub id: PrId,
@@ -77,8 +98,8 @@ pub struct PullRequest {
     pub updated_at: DateTime<Utc>,
     pub is_draft: bool,
     pub review_decision: Option<ReviewDecision>,
-    pub total_comments: u64,
-    pub last_commenter: Option<String>,
+    pub comments: CommentActivity,
+    pub review_threads: CommentActivity,
     pub ci_status: Option<CiStatus>,
 }
 
