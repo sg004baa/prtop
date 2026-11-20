@@ -8,6 +8,7 @@ use reqwest::Client;
 use serde_json::json;
 
 use super::limits::{Limits, SharedLimits, for_viewer};
+use crate::config::ReviewConfig;
 use crate::error::AppError;
 use crate::github::query::{self, SEARCH_PRS_QUERY};
 use crate::github::types::{GraphQlResponse, PrNode, RecentComment};
@@ -22,6 +23,7 @@ pub struct GitHubClient {
     pub(super) client: Client,
     pub(super) token: String,
     pub(super) api_base: String,
+    pub(super) review_config: ReviewConfig,
     gate: Arc<Mutex<RequestGate>>,
 }
 
@@ -231,20 +233,20 @@ impl GitHubClient {
             gate: Arc::new(Mutex::new(RequestGate::default())),
             token,
             api_base: GITHUB_API_BASE.to_string(),
+            review_config: ReviewConfig::default(),
         }
+    }
+
+    pub fn with_review_config(mut self, review_config: ReviewConfig) -> Self {
+        self.review_config = review_config;
+        self
     }
 
     #[cfg(test)]
     pub fn new_with_base_url(token: String, api_base: String) -> Self {
-        Self {
-            client: Client::builder()
-                .user_agent(concat!("prtop/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .expect("failed to build HTTP client"),
-            gate: Arc::new(Mutex::new(RequestGate::default())),
-            token,
-            api_base,
-        }
+        let mut client = Self::new(token);
+        client.api_base = api_base;
+        client
     }
 
     pub async fn ci_warning(&self) -> Option<String> {

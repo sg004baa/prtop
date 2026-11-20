@@ -125,11 +125,23 @@ flapping can be noisy.
 
 ## Review progress
 
-The `REVIEW` column shows `approved 1/2`: approvals out of unique people who
+The `REVIEW` column shows `approved 1/2`: approvals out of unique accounts that
 have submitted a review or currently have a review request. The PR author and
 unsubmitted (pending) reviews are excluded. Below 100 terminal columns the
 label is shortened to `1/2`. A dash (`—`) means no reviewers; `?` means loading
 or an unavailable/incomplete review fetch.
+
+GitHub `Bot` accounts, such as CodeRabbit, are excluded by default from both
+submitted reviews and outstanding requests. The `REVIEW` column and the
+`pr_approved` notification use the same filtered counts. Set `exclude_bots = false`
+to include bots, and use `excluded_reviewers` to exclude specific GitHub logins
+regardless of account type. Login matching is case-insensitive.
+
+```toml
+[review]
+exclude_bots = true  # default
+excluded_reviewers = ["review-helper"]  # optional
+```
 
 - A person's latest approval or changes-requested decision counts. A later
   comment does not revoke that decision; a dismissed review does.
