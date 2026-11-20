@@ -14,7 +14,7 @@ query($owner: String!, $repo: String!, $number: Int!, $reviewsAfter: String, $re
       headRefOid updatedAt state isDraft author { login }
       reviews(first: 100, after: $reviewsAfter) {
         pageInfo { hasNextPage endCursor }
-        nodes { state submittedAt author { login } }
+        nodes { state submittedAt author { __typename login } }
       }
       reviewRequests(first: 100, after: $requestsAfter) {
         pageInfo { hasNextPage endCursor }
@@ -68,7 +68,13 @@ struct Connection<T> {
 struct Review {
     state: String,
     submitted_at: Option<String>,
-    author: Option<ActorNode>,
+    author: Option<ReviewAuthor>,
+}
+#[derive(Deserialize)]
+struct ReviewAuthor {
+    #[serde(rename = "__typename")]
+    kind: String,
+    login: String,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -172,6 +178,10 @@ impl GitHubClient {
                     if review.state == "PENDING" {
                         continue;
                     }
+                    let reviewer = review.author.ok_or_else(|| invalid("missing reviewer"))?;
+                    if self.review_config.excludes(&reviewer.login, &reviewer.kind) {
+                        continue;
+                    }
                     if !matches!(
                         review.state.as_str(),
                         "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED" | "DISMISSED"
@@ -179,10 +189,7 @@ impl GitHubClient {
                         return Err(invalid("unknown review state"));
                     }
                     reviews.push(SubmittedReview {
-                        login: review
-                            .author
-                            .ok_or_else(|| invalid("missing reviewer"))?
-                            .login,
+                        login: reviewer.login,
                         state: review.state,
                         submitted_at: review
                             .submitted_at
@@ -201,7 +208,10 @@ impl GitHubClient {
                             teams.push(reviewer.id.ok_or_else(|| invalid("missing team id"))?)
                         }
                         "User" | "Bot" | "Mannequin" => {
-                            requested.push(reviewer.login.ok_or_else(|| invalid("missing login"))?)
+                            let login = reviewer.login.ok_or_else(|| invalid("missing login"))?;
+                            if !self.review_config.excludes(&login, &reviewer.kind) {
+                                requested.push(login);
+                            }
                         }
                         _ => return Err(invalid("unknown requested reviewer type")),
                     }
@@ -237,7 +247,7 @@ mod tests {
         }}}})
     }
     fn review(login: &str, state: &str) -> serde_json::Value {
-        json!({"author": {"login": login}, "state": state, "submittedAt": "2026-10-21T00:00:00Z"})
+        json!({"author": {"__typename": "User", "login": login}, "state": state, "submittedAt": "2026-10-21T00:00:00Z"})
     }
     fn id() -> PrId {
         PrId {
@@ -341,7 +351,7 @@ mod tests {
     async fn incomplete_or_unknown_review_data_is_not_approved() {
         for bad in [
             json!({"state": "APPROVED", "submittedAt": "2026-01-01", "author": null}),
-            json!({"state": "FUTURE", "submittedAt": "2026-01-01", "author": {"login": "alice"}}),
+            review("alice", "FUTURE"),
         ] {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
@@ -356,7 +366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bot_and_enterprise_team_requests_block_completion() {
+    async fn enterprise_team_requests_block_completion_when_bot_requests_are_excluded() {
         let server = MockServer::start().await;
         let body = page(
             json!([review("alice", "APPROVED")]),
@@ -372,8 +382,46 @@ mod tests {
         let client = GitHubClient::new_with_base_url("token".into(), server.uri());
         let summary = client.fetch_review_summary(&id()).await.unwrap().summary;
         assert_eq!(summary.approved, 1);
-        assert_eq!(summary.total, 2);
+        assert_eq!(summary.total, 1);
         assert_eq!(summary.pending_teams, 1);
+        assert!(!summary.all_approved());
+    }
+
+    #[tokio::test]
+    async fn filters_submitted_reviews_and_requests_using_the_same_config() {
+        let server = MockServer::start().await;
+        let mut bot_review = review("coderabbitai[bot]", "COMMENTED");
+        bot_review["author"]["__typename"] = "Bot".into();
+        let body = page(
+            json!([
+                review("alice", "APPROVED"),
+                bot_review,
+                review("review-helper", "CHANGES_REQUESTED"),
+            ]),
+            json!([
+                {"requestedReviewer": {"__typename": "Bot", "login": "automated-review[bot]"}},
+                {"requestedReviewer": {"__typename": "User", "login": "automation-account"}},
+            ]),
+        );
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let config = r#"excluded_reviewers = ["Review-Helper", "Automation-Account"]"#;
+        let client = GitHubClient::new_with_base_url("token".into(), server.uri())
+            .with_review_config(toml::from_str(config).unwrap());
+        let summary = client.fetch_review_summary(&id()).await.unwrap().summary;
+        assert_eq!(summary.approved, 1);
+        assert_eq!(summary.total, 1);
+        assert!(summary.all_approved());
+
+        let config = format!("{config}\nexclude_bots = false");
+        let client = client.with_review_config(toml::from_str(&config).unwrap());
+        let summary = client.fetch_review_summary(&id()).await.unwrap().summary;
+        assert_eq!(summary.approved, 1);
+        assert_eq!(summary.total, 3);
+        assert!(!summary.changes_requested);
         assert!(!summary.all_approved());
     }
 }

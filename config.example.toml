@@ -10,6 +10,13 @@ poll_interval_secs = 60
 # continue updating. Each failed token emits an error identified as
 # "GitHub token #N", rather than an organization name.
 
+# Review progress and all-reviewers-approved notifications
+# Exclude GitHub Bot accounts from submitted reviews and review requests.
+# Use excluded_reviewers for individual logins (case-insensitive).
+# [review]
+# exclude_bots = true
+# excluded_reviewers = ["review-helper"]
+
 # Notifications (via OSC 9 — requires terminal support, e.g. WezTerm)
 #
 # `enabled` is a global kill switch — defaults to false, so notifications stay

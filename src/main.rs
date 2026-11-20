@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .github_tokens
         .iter()
         .cloned()
-        .map(GitHubClient::new)
+        .map(|token| GitHubClient::new(token).with_review_config(config.review.clone()))
         .collect();
     let poll_cancel = cancel.clone();
     let poll_tx = msg_tx.clone();
