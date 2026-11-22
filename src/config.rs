@@ -89,6 +89,32 @@ struct ColorsFileConfig {
     footer_count: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ReviewConfig {
+    exclude_bots: bool,
+    excluded_reviewers: Vec<String>,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            exclude_bots: true,
+            excluded_reviewers: Vec::new(),
+        }
+    }
+}
+
+impl ReviewConfig {
+    pub(crate) fn excludes(&self, login: &str, kind: &str) -> bool {
+        (self.exclude_bots && kind == "Bot")
+            || self
+                .excluded_reviewers
+                .iter()
+                .any(|excluded| excluded.eq_ignore_ascii_case(login))
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct FileConfig {
     github_tokens: Option<Vec<String>>,
@@ -96,6 +122,8 @@ struct FileConfig {
     poll_interval_secs: Option<u64>,
     notify: Option<NotifyFileConfig>,
     colors: Option<ColorsFileConfig>,
+    #[serde(default)]
+    review: ReviewConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +134,7 @@ pub struct Config {
     pub notify_enabled: bool,
     pub notify_events: HashSet<NotifyEvent>,
     pub color_scheme: ColorScheme,
+    pub review: ReviewConfig,
 }
 
 pub(crate) fn resolve_poll_interval(cli: Option<u64>, file: Option<u64>) -> u64 {
@@ -161,6 +190,25 @@ mod token_tests {
             ["token-a".to_string(), "token-b".to_string()]
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn review_config_defaults_and_matches_explicit_logins_case_insensitively() {
+    let config: FileConfig = toml::from_str("").unwrap();
+    assert!(config.review.excludes("coderabbitai[bot]", "Bot"));
+    assert!(!config.review.excludes("review-helper", "User"));
+
+    let config: FileConfig = toml::from_str(
+        r#"
+        [review]
+        exclude_bots = false
+        excluded_reviewers = ["Review-Helper"]
+        "#,
+    )
+    .unwrap();
+    assert!(!config.review.excludes("coderabbitai[bot]", "Bot"));
+    assert!(config.review.excludes("review-helper", "User"));
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -265,6 +313,7 @@ impl Config {
             notify_enabled,
             notify_events,
             color_scheme,
+            review: file.review,
         })
     }
 }
